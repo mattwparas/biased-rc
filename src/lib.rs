@@ -4,6 +4,7 @@ use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::hint::black_box;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
@@ -370,7 +371,7 @@ pub trait BiasedMerge {
     unsafe fn drop_contents_and_maybe_box_outer(&mut self);
 }
 
-impl<T: ?Sized> BiasedMerge for HybridRc<T> {
+impl<T: ?Sized> BiasedMerge for BiasedRc<T> {
     fn merge(mut self) {
         let mut old;
         let mut new;
@@ -409,13 +410,13 @@ impl<T: ?Sized> BiasedMerge for HybridRc<T> {
 }
 
 impl TypeMap {
-    pub fn insert<T: ?Sized + 'static>(&mut self, value: HybridRc<T>) {
+    pub fn insert<T: ?Sized + 'static>(&mut self, value: BiasedRc<T>) {
         self.inner.push(Box::new(ManuallyDrop::new(value)));
     }
 
-    pub fn enqueue<T: ?Sized + 'static>(value: &HybridRc<T>) {
+    pub fn enqueue<T: ?Sized + 'static>(value: &BiasedRc<T>) {
         println!("Enqueueing value");
-        TL_QUEUE.with_borrow_mut(|queue| queue.insert(HybridRc::from_inner(value.ptr)))
+        TL_QUEUE.with_borrow_mut(|queue| queue.insert(BiasedRc::from_inner(value.ptr)))
     }
 
     pub fn run_explicit_merge() {
@@ -460,46 +461,46 @@ impl TypeMap {
     }
 }
 
-impl HybridRc<dyn Any> {
+impl BiasedRc<dyn Any> {
     #[inline]
-    pub fn downcast<T: Any>(self) -> Result<HybridRc<T>, Self> {
+    pub fn downcast<T: Any>(self) -> Result<BiasedRc<T>, Self> {
         if (*self).is::<T>() {
             let ptr = self.ptr.cast::<RcBox<T>>();
             mem::forget(self);
-            Ok(HybridRc::from_inner(ptr))
+            Ok(BiasedRc::from_inner(ptr))
         } else {
             Err(self)
         }
     }
 }
 
-impl HybridRc<dyn Any + Sync + Send> {
+impl BiasedRc<dyn Any + Sync + Send> {
     #[inline]
-    pub fn downcast<T: Any + Sync + Send>(self) -> Result<HybridRc<T>, Self> {
+    pub fn downcast<T: Any + Sync + Send>(self) -> Result<BiasedRc<T>, Self> {
         if (*self).is::<T>() {
             let ptr = self.ptr.cast::<RcBox<T>>();
             mem::forget(self);
-            Ok(HybridRc::from_inner(ptr))
+            Ok(BiasedRc::from_inner(ptr))
         } else {
             Err(self)
         }
     }
 }
 
-impl<T: Any + 'static> From<HybridRc<T>> for HybridRc<dyn Any + 'static> {
+impl<T: Any + 'static> From<BiasedRc<T>> for BiasedRc<dyn Any + 'static> {
     #[inline]
-    fn from(src: HybridRc<T>) -> Self {
+    fn from(src: BiasedRc<T>) -> Self {
         let ptr = src.ptr.as_ptr() as *mut RcBox<dyn Any>;
         mem::forget(src);
         Self::from_inner(unsafe { NonNull::new_unchecked(ptr) })
     }
 }
 
-impl<T: Any + Sync + Send + 'static> From<HybridRc<T>>
-    for HybridRc<dyn Any + Sync + Send + 'static>
+impl<T: Any + Sync + Send + 'static> From<BiasedRc<T>>
+    for BiasedRc<dyn Any + Sync + Send + 'static>
 {
     #[inline]
-    fn from(src: HybridRc<T>) -> Self {
+    fn from(src: BiasedRc<T>) -> Self {
         let ptr = src.ptr.as_ptr() as *mut RcBox<dyn Any + Sync + Send>;
         mem::forget(src);
         Self::from_inner(unsafe { NonNull::new_unchecked(ptr) })
@@ -735,15 +736,12 @@ fn set_ptr_value<T: ?Sized, U>(mut meta_ptr: *const T, addr_ptr: *mut U) -> *mut
     meta_ptr as *mut T
 }
 
-pub struct HybridRc<T: ?Sized + 'static> {
+pub struct BiasedRc<T: ?Sized + 'static> {
     ptr: NonNull<RcBox<T>>,
     phantom2: PhantomData<RcBox<T>>,
 }
 
-impl<T: ?Sized> HybridRc<T> {
-    /// Creates a new `HybridRc` from a pointer to a shared allocation.
-    ///
-    /// The reference counters must have been updated by the caller.
+impl<T: ?Sized> BiasedRc<T> {
     #[inline(always)]
     fn from_inner(ptr: NonNull<RcBox<T>>) -> Self {
         Self {
@@ -772,10 +770,6 @@ impl<T: ?Sized> HybridRc<T> {
         unsafe { &(*self.ptr.as_ptr()).rcword }
     }
 
-    /// Provides a reference to the inner `HybridRc` of a `Pin<HybridRc<T>>`
-    ///
-    /// # Safety
-    /// The caller must ensure that the reference is not used to move the value out of self.
     #[inline(always)]
     unsafe fn pin_get_ref(this: &Pin<Self>) -> &Self {
         // SAFETY: Pin is repr(transparent) and by contract the caller doesn't use the reference
@@ -789,10 +783,6 @@ impl<T: ?Sized> HybridRc<T> {
         unsafe { &mut (*this.ptr.as_ptr()).data }
     }
 
-    /// Returns a mutable reference to the value, iff the value is not shared
-    /// with another `HybridRc` or [`Weak`].
-    ///
-    /// Returns `None` otherwise.
     #[must_use]
     #[inline]
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
@@ -805,10 +795,6 @@ impl<T: ?Sized> HybridRc<T> {
         // }
     }
 
-    /// Provides a raw pointer to the referenced value
-    ///
-    /// The counts are not affected in any way and the `HybridRc` is not consumed.
-    /// The pointer is valid for as long there exists at least one `HybridRc` for the value.
     #[must_use]
     #[inline]
     pub fn as_ptr(this: &Self) -> *const T {
@@ -819,10 +805,6 @@ impl<T: ?Sized> HybridRc<T> {
         unsafe { ptr::addr_of_mut!((*ptr).data) }
     }
 
-    /// Consumes the `HybridRc<T, State>`, returning the wrapped pointer.
-    ///
-    /// To avoid a memory leak the pointer must be converted back to a `HybridRc` using
-    /// [`HybridRc<T, State>::from_raw()`].
     #[must_use = "Memory will leak if the result is not used"]
     pub fn into_raw(this: Self) -> *const T {
         let ptr = Self::as_ptr(&this);
@@ -830,21 +812,6 @@ impl<T: ?Sized> HybridRc<T> {
         ptr
     }
 
-    /// Reconstructs a `HybridRc<T, State>` from a raw pointer.
-    ///
-    /// Creates a `HybridRc<T, State>` from a pointer that has been previously returned by
-    /// a call to [`into_raw()`].
-    ///
-    /// # Safety
-    ///
-    /// The raw pointer must have been previously returned by a call to
-    /// [`HybridRc<T, State>`][`into_raw()`] for the same `State` *and* the same `T` or another
-    /// compatible type that has the same size and alignment. The latter case amounts to
-    /// [`mem::transmute()`] and is likely to produce undefined behaviour if not handled correctly.
-    ///
-    /// The value must not have been dropped yet.
-    ///
-    /// [`into_raw()`]: Self::into_raw
     pub unsafe fn from_raw(ptr: *const T) -> Self {
         // Safety: covered by the safety contract for this function
         let box_ptr = unsafe { RcBox::<T>::ptr_from_data_ptr(ptr) };
@@ -852,18 +819,16 @@ impl<T: ?Sized> HybridRc<T> {
         Self::from_inner(NonNull::new(box_ptr as *mut _).expect("invalid pointer"))
     }
 
-    /// Checks if two `HybridRc`s point to the same allocation.
     #[inline]
-    pub fn ptr_eq(this: &Self, other: &HybridRc<T>) -> bool {
+    pub fn ptr_eq(this: &Self, other: &BiasedRc<T>) -> bool {
         this.ptr.as_ptr() == other.ptr.as_ptr()
     }
 
-    /// Checks if two pinned `HybridRc`s point to the same allocation.
     #[inline]
-    pub fn ptr_eq_pin(this: &Pin<Self>, other: &Pin<HybridRc<T>>) -> bool {
+    pub fn ptr_eq_pin(this: &Pin<Self>, other: &Pin<BiasedRc<T>>) -> bool {
         // SAFETY: we are not moving anything and we don't expose any pointers.
         let this = unsafe { Self::pin_get_ref(this) };
-        let other = unsafe { HybridRc::<T>::pin_get_ref(other) };
+        let other = unsafe { BiasedRc::<T>::pin_get_ref(other) };
         this.ptr.as_ptr() == other.ptr.as_ptr()
     }
 
@@ -911,7 +876,7 @@ impl<T: ?Sized> HybridRc<T> {
     }
 }
 
-impl<T> HybridRc<T> {
+impl<T> BiasedRc<T> {
     #[inline]
     pub fn new(data: T) -> Self {
         let mut inner = RcBox::allocate(Self::build_new_meta());
@@ -922,9 +887,9 @@ impl<T> HybridRc<T> {
 
     /// Creates a new `HybridRc` with uninitialized contents.
     #[inline]
-    pub fn new_uninit() -> HybridRc<mem::MaybeUninit<T>> {
+    pub fn new_uninit() -> BiasedRc<mem::MaybeUninit<T>> {
         let inner = RcBox::allocate(Self::build_new_meta());
-        HybridRc::from_inner(inner)
+        BiasedRc::from_inner(inner)
     }
 
     /// Creates a new `HybridRc` with uninitialized contents, with the memory being filled with
@@ -934,10 +899,10 @@ impl<T> HybridRc<T> {
     ///
     /// [`MaybeUninit::zeroed()`]: mem::MaybeUninit::zeroed
     #[inline]
-    pub fn new_zeroed() -> HybridRc<mem::MaybeUninit<T>> {
+    pub fn new_zeroed() -> BiasedRc<mem::MaybeUninit<T>> {
         let mut inner = RcBox::allocate(Self::build_new_meta());
         unsafe { inner.as_mut() }.data = mem::MaybeUninit::zeroed();
-        HybridRc::from_inner(inner)
+        BiasedRc::from_inner(inner)
     }
 
     /// Creates a new `Pin<HybridRc<T>>`. If `T` does not implement `Unpin`, then `data` will be
@@ -954,15 +919,15 @@ impl<T> HybridRc<T> {
         Ok(Self::from_inner(unsafe { inner.assume_init() }.into()))
     }
 
-    pub fn try_new_uninit() -> Result<HybridRc<mem::MaybeUninit<T>>, AllocError> {
+    pub fn try_new_uninit() -> Result<BiasedRc<mem::MaybeUninit<T>>, AllocError> {
         let inner = RcBox::try_allocate(Self::build_new_meta()).map_err(|_| AllocError)?;
-        Ok(HybridRc::from_inner(inner.into()))
+        Ok(BiasedRc::from_inner(inner.into()))
     }
 
-    pub fn try_new_zeroed() -> Result<HybridRc<mem::MaybeUninit<T>>, AllocError> {
+    pub fn try_new_zeroed() -> Result<BiasedRc<mem::MaybeUninit<T>>, AllocError> {
         let mut inner = RcBox::try_allocate(Self::build_new_meta()).map_err(|_| AllocError)?;
         unsafe { inner.as_mut() }.data = mem::MaybeUninit::zeroed();
-        Ok(HybridRc::from_inner(inner))
+        Ok(BiasedRc::from_inner(inner))
     }
 
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
@@ -1042,7 +1007,7 @@ impl From<Infallible> for AllocError {
     }
 }
 
-impl<T: ?Sized> Deref for HybridRc<T> {
+impl<T: ?Sized> Deref for BiasedRc<T> {
     type Target = T;
 
     #[inline]
@@ -1051,21 +1016,21 @@ impl<T: ?Sized> Deref for HybridRc<T> {
     }
 }
 
-impl<T: ?Sized> Borrow<T> for HybridRc<T> {
+impl<T: ?Sized> Borrow<T> for BiasedRc<T> {
     #[inline]
     fn borrow(&self) -> &T {
         &**self
     }
 }
 
-impl<T: ?Sized> AsRef<T> for HybridRc<T> {
+impl<T: ?Sized> AsRef<T> for BiasedRc<T> {
     #[inline]
     fn as_ref(&self) -> &T {
         &**self
     }
 }
 
-impl<T: ?Sized> Clone for HybridRc<T> {
+impl<T: ?Sized> Clone for BiasedRc<T> {
     #[inline]
     fn clone(&self) -> Self {
         self.get_box().increment();
@@ -1073,7 +1038,7 @@ impl<T: ?Sized> Clone for HybridRc<T> {
     }
 }
 
-impl<T: ?Sized + 'static> Drop for HybridRc<T> {
+impl<T: ?Sized + 'static> Drop for BiasedRc<T> {
     #[inline]
     fn drop(&mut self) {
         match self.get_box().decrement() {
@@ -1091,7 +1056,7 @@ impl<T: ?Sized + 'static> Drop for HybridRc<T> {
 
 // Propagate some useful traits implemented by the inner type
 
-impl<T: Default> Default for HybridRc<T> {
+impl<T: Default> Default for BiasedRc<T> {
     /// Creates a new `HybridRc`, with the `Default` value for `T`.
     #[inline]
     fn default() -> Self {
@@ -1099,37 +1064,37 @@ impl<T: Default> Default for HybridRc<T> {
     }
 }
 
-impl<T: ?Sized + PartialEq> PartialEq<HybridRc<T>> for HybridRc<T> {
+impl<T: ?Sized + PartialEq> PartialEq<BiasedRc<T>> for BiasedRc<T> {
     /// Equality for `HybridRc`s.
     ///
     /// Two `HybridRc`s are equal if their inner values are equal, independent of if they are
     /// stored in the same allocation.
     #[inline]
-    fn eq(&self, other: &HybridRc<T>) -> bool {
+    fn eq(&self, other: &BiasedRc<T>) -> bool {
         **self == **other
     }
 }
 
-impl<T: ?Sized + Eq> Eq for HybridRc<T> {}
+impl<T: ?Sized + Eq> Eq for BiasedRc<T> {}
 
-impl<T: ?Sized + Hash> Hash for HybridRc<T> {
+impl<T: ?Sized + Hash> Hash for BiasedRc<T> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         Self::data(self).hash(state);
     }
 }
 
-impl<T: ?Sized + PartialOrd> PartialOrd<HybridRc<T>> for HybridRc<T> {
+impl<T: ?Sized + PartialOrd> PartialOrd<BiasedRc<T>> for BiasedRc<T> {
     /// Partial comparison for `HybridRc`s.
     ///
     /// The two are compared by calling `partial_cmp()` on their inner values.
     #[inline]
-    fn partial_cmp(&self, other: &HybridRc<T>) -> Option<cmp::Ordering> {
+    fn partial_cmp(&self, other: &BiasedRc<T>) -> Option<cmp::Ordering> {
         (**self).partial_cmp(&**other)
     }
 }
 
-impl<T: ?Sized + Ord> Ord for HybridRc<T> {
+impl<T: ?Sized + Ord> Ord for BiasedRc<T> {
     /// Comparison for `HybridRc`s.
     ///
     /// The two are compared by calling `cmp()` on their inner values.
@@ -1139,14 +1104,14 @@ impl<T: ?Sized + Ord> Ord for HybridRc<T> {
     }
 }
 
-impl<T: ?Sized + fmt::Display> fmt::Display for HybridRc<T> {
+impl<T: ?Sized + fmt::Display> fmt::Display for BiasedRc<T> {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&Self::data(self), f)
     }
 }
 
-impl<T: ?Sized + fmt::Debug> fmt::Debug for HybridRc<T> {
+impl<T: ?Sized + fmt::Debug> fmt::Debug for BiasedRc<T> {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&Self::data(self), f)
@@ -1154,7 +1119,7 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for HybridRc<T> {
 }
 
 // `HybridRc` can be formatted as a pointer.
-impl<T: ?Sized> fmt::Pointer for HybridRc<T> {
+impl<T: ?Sized> fmt::Pointer for BiasedRc<T> {
     /// Formats the value using the given formatter.
     ///
     /// If the `#` flag is used, the state (shared/local) is written after the address.
@@ -1167,14 +1132,14 @@ impl<T: ?Sized> fmt::Pointer for HybridRc<T> {
 /// so moving `HybridRc<T>` doesn't move the content even if `T` is not `Unpin`.
 ///
 /// This allows unpinning e.g. `Pin<Box<HybridRc<T>>>` but not any `Pin<HybridRc<T>>`!
-impl<T: ?Sized> Unpin for HybridRc<T> {}
+impl<T: ?Sized> Unpin for BiasedRc<T> {}
 
-unsafe impl<T: ?Sized + Sync + Send> Send for HybridRc<T> {}
-unsafe impl<T: ?Sized + Sync + Send> Sync for HybridRc<T> {}
+unsafe impl<T: ?Sized + Sync + Send> Send for BiasedRc<T> {}
+unsafe impl<T: ?Sized + Sync + Send> Sync for BiasedRc<T> {}
 
 #[test]
 fn does_this_work() {
-    let value = HybridRc::new(10);
+    let value = BiasedRc::new(10);
     println!("{}", value);
 }
 
@@ -1188,7 +1153,7 @@ fn test_drop_impl() {
             println!("Calling drop: {}", self.foo);
         }
     }
-    let value = HybridRc::new(Foo { foo: 10 });
+    let value = BiasedRc::new(Foo { foo: 10 });
 
     drop(value);
 }
@@ -1203,8 +1168,8 @@ fn test_clone_impl() {
             println!("Calling drop: {}", self.foo);
         }
     }
-    let value = HybridRc::new(Foo { foo: 10 });
-    let cloned = HybridRc::clone(&value);
+    let value = BiasedRc::new(Foo { foo: 10 });
+    let cloned = BiasedRc::clone(&value);
 
     drop(value);
 
@@ -1223,8 +1188,8 @@ fn test_queue_impl() {
             println!("Calling drop: {}", self.foo);
         }
     }
-    let value = HybridRc::new(Foo { foo: 10 });
-    let cloned = HybridRc::clone(&value);
+    let value = BiasedRc::new(Foo { foo: 10 });
+    let cloned = BiasedRc::clone(&value);
 
     let thread = std::thread::spawn(move || {
         drop(cloned);
