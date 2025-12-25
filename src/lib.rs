@@ -7,6 +7,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::NonNull;
+use std::sync::{LazyLock, Mutex};
 use std::{cell::Cell, sync::atomic::Ordering, thread::current};
 
 use atomic::Atomic;
@@ -192,7 +193,7 @@ pub struct RcWord {
 #[repr(C, packed)]
 #[derive(Copy, Clone, PartialEq, Eq, NoUninit, Debug)]
 pub struct Shared {
-    counter: u32,
+    counter: i32,
     merged: bool,
     queued: bool,
     _align: [i8; 2],
@@ -217,6 +218,13 @@ impl RcWord {
             }),
         }
     }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum DecrementAction {
+    DoNothing,
+    Queue,
+    Deallocate,
 }
 
 impl<T: ?Sized> RcBox<T> {
@@ -259,7 +267,7 @@ impl<T: ?Sized> RcBox<T> {
         }
     }
 
-    pub fn decrement(&self) -> bool {
+    pub fn decrement(&self) -> DecrementAction {
         let owner_tid = self.rcword.thread_id.get();
         let my_tid = ThreadId::current_thread();
 
@@ -270,10 +278,10 @@ impl<T: ?Sized> RcBox<T> {
         }
     }
 
-    pub fn fast_decrement(&self) -> bool {
+    pub fn fast_decrement(&self) -> DecrementAction {
         self.rcword.biased_counter.update(|x| x - 1);
         if self.rcword.biased_counter.get() > 0 {
-            return false;
+            return DecrementAction::DoNothing;
         }
 
         let mut new;
@@ -293,27 +301,27 @@ impl<T: ?Sized> RcBox<T> {
         }
 
         if new.counter == 0 {
-            // self.deallocate()
-
-            true
+            DecrementAction::Deallocate
         } else {
             self.rcword.thread_id.set(None);
 
-            false
+            DecrementAction::DoNothing
         }
     }
 
-    pub fn slow_decrement(&self) -> bool {
+    pub fn slow_decrement(&self) -> DecrementAction {
         let mut old;
         let mut new;
         loop {
             old = self.rcword.shared.load(Ordering::Relaxed);
             new = old;
 
-            if new.counter == 0 {
+            new.counter -= 1;
+
+            println!("Slow decrement: {:?}", new);
+
+            if new.counter < 0 {
                 new.queued = true;
-            } else {
-                new.counter -= 1;
             }
 
             if self
@@ -326,48 +334,137 @@ impl<T: ?Sized> RcBox<T> {
             }
         }
 
+        dbg!(old);
+        dbg!(new);
+
         if old.queued != new.queued {
-            self.queue();
-            false
+            DecrementAction::Queue
         } else if new.merged && new.counter == 0 {
-            // self.deallocate()
-            true
+            DecrementAction::Deallocate
         } else {
-            false
+            DecrementAction::Deallocate
         }
     }
 
     pub fn queue(&self) {
-        // TODO:
         todo!()
+
+        // TODO:
+        // todo!()
     }
 }
 
 // Set up the queue to save ourselves... or something
-struct QueuedObjects {
+pub struct QueuedObjects {
     // TODO: Except don't have this just be TypeId -> T,
     // just have it be like, HashMap<T, Vec<HybridRc<dyn ANy>>>
     map: HashMap<TypeId, Vec<Box<dyn Any>>>,
 }
 
-struct TypeMap {
-    layouts: HashMap<TypeId, Layout>,
-    inner: HashMap<TypeId, Box<dyn Any>>,
+#[derive(Default)]
+pub struct TypeMap {
+    // layouts: HashMap<TypeId, Layout>,
+    inner: HashMap<TypeId, Vec<HybridRc<dyn Any + Send + Sync + 'static>>>,
 }
 
-impl TypeMap {
-    fn insert<T: Any + 'static>(&mut self, value: T) {
-        let layout = Layout::for_value(&value);
+static QUEUE: LazyLock<Mutex<TypeMap>> = LazyLock::new(|| Mutex::new(TypeMap::default()));
 
-        // Get the layout for the type on the way out?
-        self.layouts.insert(TypeId::of::<T>(), layout);
-        self.inner.insert(TypeId::of::<T>(), Box::new(value));
+impl TypeMap {
+    pub fn insert<T: Any + Send + Sync + 'static>(&mut self, value: HybridRc<T>) {
+        // let layout = Layout::for_value(&value);
+        // // Get the layout for the type on the way out?
+        // self.layouts.insert(TypeId::of::<T>(), layout);
+
+        let type_id = TypeId::of::<T>();
+
+        if let Some(exists) = self.inner.get_mut(&type_id) {
+            exists.push(value.into());
+        } else {
+            self.inner.insert(TypeId::of::<T>(), vec![value.into()]);
+        }
     }
 
-    fn get<T: Any + 'static>(&self) -> Option<&T> {
-        self.inner
-            .get(&TypeId::of::<T>())
-            .and_then(|b| b.downcast_ref::<T>())
+    pub fn enqueue<T: Any + Send + Sync + 'static>(value: &HybridRc<T>) {
+        QUEUE
+            .lock()
+            .unwrap()
+            .insert(HybridRc::from_inner(value.ptr))
+    }
+
+    pub fn explicit_merge(values: &mut Vec<HybridRc<dyn Any + Send + Sync + 'static>>) {
+        for mut value in values.drain(..) {
+            let mut old;
+            let mut new;
+            loop {
+                old = value.meta().shared.load(Ordering::AcqRel);
+                new = old;
+                new.counter += value.meta().biased_counter.get() as i32;
+                new.merged = true;
+
+                if value
+                    .meta()
+                    .shared
+                    .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+
+                if new.counter == 0 {
+                    unsafe { value.drop_contents_and_maybe_box() };
+                } else {
+                    value.meta().thread_id.set(None);
+                }
+            }
+
+            std::mem::forget(value);
+        }
+    }
+}
+
+impl HybridRc<dyn Any> {
+    #[inline]
+    pub fn downcast<T: Any>(self) -> Result<HybridRc<T>, Self> {
+        if (*self).is::<T>() {
+            let ptr = self.ptr.cast::<RcBox<T>>();
+            mem::forget(self);
+            Ok(HybridRc::from_inner(ptr))
+        } else {
+            Err(self)
+        }
+    }
+}
+
+impl HybridRc<dyn Any + Sync + Send> {
+    #[inline]
+    pub fn downcast<T: Any + Sync + Send>(self) -> Result<HybridRc<T>, Self> {
+        if (*self).is::<T>() {
+            let ptr = self.ptr.cast::<RcBox<T>>();
+            mem::forget(self);
+            Ok(HybridRc::from_inner(ptr))
+        } else {
+            Err(self)
+        }
+    }
+}
+
+impl<T: Any + 'static> From<HybridRc<T>> for HybridRc<dyn Any + 'static> {
+    #[inline]
+    fn from(src: HybridRc<T>) -> Self {
+        let ptr = src.ptr.as_ptr() as *mut RcBox<dyn Any>;
+        mem::forget(src);
+        Self::from_inner(unsafe { NonNull::new_unchecked(ptr) })
+    }
+}
+
+impl<T: Any + Sync + Send + 'static> From<HybridRc<T>>
+    for HybridRc<dyn Any + Sync + Send + 'static>
+{
+    #[inline]
+    fn from(src: HybridRc<T>) -> Self {
+        let ptr = src.ptr.as_ptr() as *mut RcBox<dyn Any + Sync + Send>;
+        mem::forget(src);
+        Self::from_inner(unsafe { NonNull::new_unchecked(ptr) })
     }
 }
 
@@ -735,12 +832,7 @@ impl<T: ?Sized> HybridRc<T> {
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
         // let meta = this.meta();
-        // meta.strong_shared.load(Ordering::SeqCst)
-        //     + if State::SHARED {
-        //         0
-        //     } else {
-        //         meta.strong_local.get() - 1
-        //     }
+        // meta.shared.load(Ordering::SeqCst).counter as usize + meta.biased_counter.get() - 1
 
         todo!()
     }
@@ -752,26 +844,6 @@ impl<T: ?Sized> HybridRc<T> {
         // SAFETY: We are not moving anything and we don't expose any pointers.
         let this = unsafe { Self::pin_get_ref(this) };
         Self::strong_count(this)
-    }
-
-    #[inline]
-    pub fn weak_count(this: &Self) -> usize {
-        // match this.meta().weak.load(Ordering::SeqCst) {
-        //     // Lock value => there were zero weak references apart from the implicit one.
-        //     usize::MAX => 0,
-        //     count => count - 1,
-        // }
-
-        todo!()
-    }
-
-    /// Gets the number of [`PinWeak`] pointers to the pinned inner value.
-    ///
-    #[inline]
-    pub fn weak_count_pin(this: &Pin<Self>) -> usize {
-        // SAFETY: We are not moving anything and we don't expose any pointers.
-        let this = unsafe { Self::pin_get_ref(this) };
-        Self::weak_count(this)
     }
 
     #[inline]
@@ -964,15 +1036,17 @@ impl<T: ?Sized> Clone for HybridRc<T> {
 }
 
 impl<T: ?Sized> Drop for HybridRc<T> {
-    /// Drops the `HybridRc`.
-    ///
-    /// This will decrement the appropriate reference count depending on `State`. If both strong
-    /// reference counts reach zero then the only other references (if any) are [`Weak`]. In that
-    /// case the inner value is dropped.
     #[inline]
     fn drop(&mut self) {
-        if self.get_box().decrement() {
-            unsafe { self.drop_contents_and_maybe_box() };
+        match self.get_box().decrement() {
+            DecrementAction::DoNothing => {}
+            DecrementAction::Queue => {
+                // Enqueue the value
+                // TypeMap::enqueue(self);
+            }
+            DecrementAction::Deallocate => {
+                unsafe { self.drop_contents_and_maybe_box() };
+            }
         }
     }
 }
@@ -1047,18 +1121,7 @@ impl<T: ?Sized> fmt::Pointer for HybridRc<T> {
     ///
     /// If the `#` flag is used, the state (shared/local) is written after the address.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // if f.alternate() {
-        //     fmt::Pointer::fmt(&Self::as_ptr(self), f)?;
-        //     f.write_str(if State::SHARED {
-        //         " [shared]"
-        //     } else {
-        //         " [local]"
-        //     })
-        // } else {
-        //     fmt::Pointer::fmt(&Self::as_ptr(self), f)
-        // }
-
-        todo!()
+        fmt::Pointer::fmt(&Self::as_ptr(self), f)
     }
 }
 
@@ -1067,6 +1130,9 @@ impl<T: ?Sized> fmt::Pointer for HybridRc<T> {
 ///
 /// This allows unpinning e.g. `Pin<Box<HybridRc<T>>>` but not any `Pin<HybridRc<T>>`!
 impl<T: ?Sized> Unpin for HybridRc<T> {}
+
+unsafe impl<T: ?Sized + Sync + Send> Send for HybridRc<T> {}
+unsafe impl<T: ?Sized + Sync + Send> Sync for HybridRc<T> {}
 
 #[test]
 fn does_this_work() {
@@ -1107,4 +1173,24 @@ fn test_clone_impl() {
     println!("Now we're done");
 
     drop(cloned);
+}
+
+#[test]
+fn test_queue_impl() {
+    struct Foo {
+        foo: usize,
+    }
+    impl Drop for Foo {
+        fn drop(&mut self) {
+            println!("Calling drop: {}", self.foo);
+        }
+    }
+    let value = HybridRc::new(Foo { foo: 10 });
+    let cloned = HybridRc::clone(&value);
+
+    let thread = std::thread::spawn(move || {
+        drop(cloned);
+    });
+
+    thread.join().unwrap();
 }
