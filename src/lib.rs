@@ -446,12 +446,13 @@ impl TypeMap {
                 {
                     break;
                 }
+            }
 
-                if new.counter == 0 {
-                    unsafe { value.drop_contents_and_maybe_box_outer() };
-                } else {
-                    value.meta_outer().thread_id.set(None);
-                }
+            if new.counter == 0 {
+                println!("invoking the destructor");
+                unsafe { value.drop_contents_and_maybe_box_outer() };
+            } else {
+                value.meta_outer().thread_id.set(None);
             }
 
             drop(value);
