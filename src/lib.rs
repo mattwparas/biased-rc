@@ -1,14 +1,16 @@
 use std::alloc::Layout;
 use std::any::{Any, TypeId};
 use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::{LazyLock, Mutex};
-use std::{cell::Cell, sync::atomic::Ordering, thread::current};
+use std::{cell::Cell, sync::atomic::Ordering};
 
 use atomic::Atomic;
 use bytemuck::NoUninit;
@@ -347,62 +349,97 @@ impl<T: ?Sized> RcBox<T> {
     }
 
     pub fn queue(&self) {
-        todo!()
-
+        // todo!()
         // TODO:
         // todo!()
     }
 }
 
-// Set up the queue to save ourselves... or something
-pub struct QueuedObjects {
-    // TODO: Except don't have this just be TypeId -> T,
-    // just have it be like, HashMap<T, Vec<HybridRc<dyn ANy>>>
-    map: HashMap<TypeId, Vec<Box<dyn Any>>>,
-}
-
 #[derive(Default)]
 pub struct TypeMap {
-    // layouts: HashMap<TypeId, Layout>,
-    inner: HashMap<TypeId, Vec<HybridRc<dyn Any + Send + Sync + 'static>>>,
+    inner: Vec<Box<ManuallyDrop<dyn BiasedMerge>>>,
 }
 
-static QUEUE: LazyLock<Mutex<TypeMap>> = LazyLock::new(|| Mutex::new(TypeMap::default()));
+thread_local! {
+    static TL_QUEUE: RefCell<TypeMap> = RefCell::new(TypeMap::default())
+}
+
+pub trait BiasedMerge {
+    fn merge(self);
+    fn meta_outer(&self) -> &RcWord;
+    unsafe fn drop_contents_and_maybe_box_outer(&mut self);
+}
+
+impl<T: ?Sized> BiasedMerge for HybridRc<T> {
+    fn merge(mut self) {
+        let mut old;
+        let mut new;
+        loop {
+            old = self.meta().shared.load(Ordering::AcqRel);
+            new = old;
+            new.counter += self.meta().biased_counter.get() as i32;
+            new.merged = true;
+
+            if self
+                .meta()
+                .shared
+                .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+
+            if new.counter == 0 {
+                unsafe { self.drop_contents_and_maybe_box() };
+            } else {
+                self.meta().thread_id.set(None);
+            }
+        }
+
+        std::mem::forget(self);
+    }
+
+    fn meta_outer(&self) -> &RcWord {
+        self.meta()
+    }
+
+    unsafe fn drop_contents_and_maybe_box_outer(&mut self) {
+        unsafe { self.drop_contents_and_maybe_box() }
+    }
+}
 
 impl TypeMap {
-    pub fn insert<T: Any + Send + Sync + 'static>(&mut self, value: HybridRc<T>) {
-        // let layout = Layout::for_value(&value);
-        // // Get the layout for the type on the way out?
-        // self.layouts.insert(TypeId::of::<T>(), layout);
-
-        let type_id = TypeId::of::<T>();
-
-        if let Some(exists) = self.inner.get_mut(&type_id) {
-            exists.push(value.into());
-        } else {
-            self.inner.insert(TypeId::of::<T>(), vec![value.into()]);
-        }
+    pub fn insert<T: ?Sized + 'static>(&mut self, value: HybridRc<T>) {
+        self.inner.push(Box::new(ManuallyDrop::new(value)));
     }
 
-    pub fn enqueue<T: Any + Send + Sync + 'static>(value: &HybridRc<T>) {
-        QUEUE
-            .lock()
-            .unwrap()
-            .insert(HybridRc::from_inner(value.ptr))
+    pub fn enqueue<T: ?Sized + 'static>(value: &HybridRc<T>) {
+        println!("Enqueueing value");
+        TL_QUEUE.with_borrow_mut(|queue| queue.insert(HybridRc::from_inner(value.ptr)))
     }
 
-    pub fn explicit_merge(values: &mut Vec<HybridRc<dyn Any + Send + Sync + 'static>>) {
+    pub fn run_explicit_merge() {
+        TL_QUEUE.with_borrow_mut(|x| Self::explicit_merge(&mut x.inner));
+    }
+
+    pub fn explicit_merge(values: &mut Vec<Box<ManuallyDrop<dyn BiasedMerge>>>) {
+        println!(
+            "Running explicit merge on thread: {:?} with count: {}",
+            std::thread::current().id(),
+            values.len()
+        );
+
         for mut value in values.drain(..) {
             let mut old;
             let mut new;
             loop {
-                old = value.meta().shared.load(Ordering::AcqRel);
+                old = value.meta_outer().shared.load(Ordering::AcqRel);
                 new = old;
-                new.counter += value.meta().biased_counter.get() as i32;
+                new.counter += value.meta_outer().biased_counter.get() as i32;
                 new.merged = true;
 
                 if value
-                    .meta()
+                    .meta_outer()
                     .shared
                     .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
@@ -411,13 +448,13 @@ impl TypeMap {
                 }
 
                 if new.counter == 0 {
-                    unsafe { value.drop_contents_and_maybe_box() };
+                    unsafe { value.drop_contents_and_maybe_box_outer() };
                 } else {
-                    value.meta().thread_id.set(None);
+                    value.meta_outer().thread_id.set(None);
                 }
             }
 
-            std::mem::forget(value);
+            drop(value);
         }
     }
 }
@@ -697,7 +734,7 @@ fn set_ptr_value<T: ?Sized, U>(mut meta_ptr: *const T, addr_ptr: *mut U) -> *mut
     meta_ptr as *mut T
 }
 
-pub struct HybridRc<T: ?Sized> {
+pub struct HybridRc<T: ?Sized + 'static> {
     ptr: NonNull<RcBox<T>>,
     phantom2: PhantomData<RcBox<T>>,
 }
@@ -1035,14 +1072,14 @@ impl<T: ?Sized> Clone for HybridRc<T> {
     }
 }
 
-impl<T: ?Sized> Drop for HybridRc<T> {
+impl<T: ?Sized + 'static> Drop for HybridRc<T> {
     #[inline]
     fn drop(&mut self) {
         match self.get_box().decrement() {
             DecrementAction::DoNothing => {}
             DecrementAction::Queue => {
                 // Enqueue the value
-                // TypeMap::enqueue(self);
+                TypeMap::enqueue(self);
             }
             DecrementAction::Deallocate => {
                 unsafe { self.drop_contents_and_maybe_box() };
@@ -1190,7 +1227,12 @@ fn test_queue_impl() {
 
     let thread = std::thread::spawn(move || {
         drop(cloned);
+
+        // Run explicit merge:
+        TypeMap::run_explicit_merge();
     });
 
     thread.join().unwrap();
+
+    TypeMap::run_explicit_merge();
 }
