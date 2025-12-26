@@ -80,7 +80,8 @@ impl PartialEq for ThreadId {
 pub struct RcWord {
     thread_id: Cell<Option<ThreadId>>,
     biased_counter: Cell<u32>,
-    shared: Atomic<Shared>,
+    // shared: Atomic<Shared>,
+    shared: SharedPacked,
 }
 
 #[repr(C, packed)]
@@ -93,6 +94,15 @@ pub struct Shared {
 }
 
 impl Shared {
+    fn new() -> Self {
+        Self {
+            counter: 0,
+            merged: false,
+            queued: false,
+            _align: Default::default(),
+        }
+    }
+
     #[inline(always)]
     fn set_queued(&mut self, queued: bool) {
         self.queued = queued;
@@ -110,25 +120,37 @@ impl Shared {
     fn get_merged(&self) -> bool {
         self.merged
     }
+
+    fn update_counter(&mut self, f: impl FnOnce(i32) -> i32) {
+        self.counter = (f)(self.counter);
+    }
+
+    fn set_counter(&mut self, counter: i32) {
+        self.counter = counter;
+    }
+
+    fn get_counter(&self) -> i32 {
+        self.counter
+    }
 }
 
 pub struct SharedPacked(AtomicU32);
 
 impl SharedPacked {
     #[inline]
-    pub fn load(&self, order: Ordering) -> u32 {
-        self.0.load(order)
+    pub fn load(&self, order: Ordering) -> Packed {
+        Packed(self.0.load(order))
     }
 
     #[inline]
     pub fn compare_exchange(
         &self,
-        current: u32,
-        new: u32,
+        current: Packed,
+        new: Packed,
         success: Ordering,
         failure: Ordering,
     ) -> Result<u32, u32> {
-        self.0.compare_exchange(current, new, success, failure)
+        self.0.compare_exchange(current.0, new.0, success, failure)
     }
 }
 
@@ -139,6 +161,7 @@ const VALUE_BITS: u32 = 30;
 const VALUE_MASK: u32 = (1 << VALUE_BITS) - 1;
 const VALUE_SIGN_BIT: u32 = 1 << (VALUE_BITS - 1);
 
+#[derive(Copy, Clone, PartialEq, PartialOrd, Debug)]
 pub struct Packed(u32);
 
 impl Packed {
@@ -176,8 +199,35 @@ impl Packed {
         self.0 & FLAG_QUEUED != 0
     }
 
-    pub fn value(&self) -> u32 {
-        self.0 & VALUE_MASK
+    // pub fn value(&self) -> i32 {
+    //     (self.0 & VALUE_MASK) as _
+    // }
+
+    pub fn get_counter(&self) -> i32 {
+        self.value()
+    }
+
+    // fn set_value(&mut self, value: i32) {
+    //     assert!(value >= -(1 << 29) && value < (1 << 29));
+    //     let v = (value as u32) & VALUE_MASK;
+    //     // self.0 = (self.0 & !VALUE_MASK) | v;
+
+    //     self.0 = v;
+    // }
+
+    fn value(&self) -> i32 {
+        let raw = self.0 & VALUE_MASK;
+
+        if raw & VALUE_SIGN_BIT != 0 {
+            // Sign-extend from bit 29
+            (raw | !VALUE_MASK) as i32
+        } else {
+            raw as i32
+        }
+    }
+
+    pub fn set_counter(&mut self, value: i32) {
+        self.set_value(value);
     }
 
     fn set_value(&mut self, value: i32) {
@@ -185,6 +235,62 @@ impl Packed {
         let v = (value as u32) & VALUE_MASK;
         self.0 = (self.0 & !VALUE_MASK) | v;
     }
+
+    fn update_counter(&mut self, f: impl FnOnce(i32) -> i32) {
+        self.set_value((f)(self.value()))
+    }
+
+    fn new_with(value: i32, merged: bool, queued: bool) -> Self {
+        // Ensure value fits in signed 30 bits
+        assert!(value >= -(1 << 29) && value < (1 << 29));
+
+        let mut bits = (value as u32) & VALUE_MASK;
+
+        if merged {
+            bits |= FLAG_MERGED;
+        }
+        if queued {
+            bits |= FLAG_QUEUED;
+        }
+
+        Self(bits)
+    }
+
+    fn new() -> Self {
+        Self::new_with(0, false, false)
+    }
+}
+
+#[test]
+fn packed_vs_unpacked() {
+    let mut packed = Packed::new();
+
+    packed.set_merged(true);
+
+    assert_eq!(packed.get_merged(), true);
+    assert_eq!(packed.get_queued(), false);
+    assert_eq!(packed.get_counter(), 0);
+
+    packed.set_merged(false);
+    assert_eq!(packed.get_merged(), false);
+    assert_eq!(packed.get_queued(), false);
+    assert_eq!(packed.get_counter(), 0);
+
+    packed.set_value(100);
+    assert_eq!(packed.get_merged(), false);
+    assert_eq!(packed.get_queued(), false);
+    assert_eq!(packed.get_counter(), 100);
+
+    packed.set_value(-1);
+    assert_eq!(packed.get_merged(), false);
+    assert_eq!(packed.get_queued(), false);
+    assert_eq!(packed.get_counter(), -1);
+
+    packed.set_value(-100);
+    packed.set_queued(true);
+    assert_eq!(packed.get_merged(), false);
+    assert_eq!(packed.get_queued(), true);
+    assert_eq!(packed.get_counter(), -100);
 }
 
 impl SharedPacked {
@@ -206,20 +312,12 @@ impl SharedPacked {
         }
     }
 
-    fn new(value: i32, merged: bool, queued: bool) -> Self {
-        // Ensure value fits in signed 30 bits
-        assert!(value >= -(1 << 29) && value < (1 << 29));
+    fn new() -> Self {
+        Self::new_with(0, false, false)
+    }
 
-        let mut bits = (value as u32) & VALUE_MASK;
-
-        if merged {
-            bits |= FLAG_MERGED;
-        }
-        if queued {
-            bits |= FLAG_QUEUED;
-        }
-
-        SharedPacked(AtomicU32::new(bits))
+    fn new_with(value: i32, merged: bool, queued: bool) -> Self {
+        SharedPacked(AtomicU32::new(Packed::new_with(value, merged, queued).0))
     }
 
     // /// Get the signed 30-bit value (sign-extended)
@@ -264,12 +362,10 @@ impl RcWord {
         Self {
             thread_id: Cell::new(Some(ThreadId::current_thread())),
             biased_counter: Cell::new(1),
-            shared: Atomic::new(Shared {
-                counter: 0,
-                merged: false,
-                queued: false,
-                _align: Default::default(),
-            }),
+
+            // Change this to be the shared packed version
+            // shared: Atomic::new(Shared::new()),
+            shared: SharedPacked::new(),
         }
     }
 }
@@ -309,7 +405,8 @@ impl<T: ?Sized> RcBox<T> {
             // Do we have to read the whole thing together?
             let old = self.rcword.shared.load(Ordering::Relaxed);
             let mut new = old;
-            new.counter += 1;
+
+            new.update_counter(|x| x + 1);
 
             if self
                 .rcword
@@ -355,7 +452,7 @@ impl<T: ?Sized> RcBox<T> {
             }
         }
 
-        if new.counter == 0 {
+        if new.get_counter() == 0 {
             DecrementAction::Deallocate
         } else {
             self.rcword.thread_id.set(None);
@@ -371,11 +468,11 @@ impl<T: ?Sized> RcBox<T> {
             old = self.rcword.shared.load(Ordering::Relaxed);
             new = old;
 
-            new.counter -= 1;
+            new.update_counter(|x| x - 1);
 
             println!("Slow decrement: {:?}", new);
 
-            if new.counter < 0 {
+            if new.get_counter() < 0 {
                 new.set_queued(true);
             }
 
@@ -391,7 +488,7 @@ impl<T: ?Sized> RcBox<T> {
 
         if old.get_queued() != new.get_queued() {
             DecrementAction::Queue
-        } else if new.get_merged() && new.counter == 0 {
+        } else if new.get_merged() && new.get_counter() == 0 {
             DecrementAction::Deallocate
         } else {
             DecrementAction::Deallocate
@@ -400,10 +497,10 @@ impl<T: ?Sized> RcBox<T> {
 
     // TODO: Figure out how to do this right?
     fn has_unique_ref(&self) -> bool {
-        let word = self.rcword.shared.load(Ordering::AcqRel);
-        let mut count = word.counter;
+        let word = self.rcword.shared.load(Ordering::Acquire);
+        let mut count = word.get_counter();
 
-        if word.counter == 0 {
+        if word.get_counter() == 0 {
             let owner = self.rcword.thread_id.get();
             match owner {
                 None => {}
@@ -442,10 +539,9 @@ impl<T: ?Sized> BiasedMerge for BiasedRc<T> {
         let mut old;
         let mut new;
         loop {
-            old = self.meta().shared.load(Ordering::AcqRel);
+            old = self.meta().shared.load(Ordering::Acquire);
             new = old;
-            new.counter += self.meta().biased_counter.get() as i32;
-
+            new.update_counter(|x| x + self.meta().biased_counter.get() as i32);
             new.set_merged(true);
 
             if self
@@ -457,7 +553,7 @@ impl<T: ?Sized> BiasedMerge for BiasedRc<T> {
                 break;
             }
 
-            if new.counter == 0 {
+            if new.get_counter() == 0 {
                 unsafe { self.drop_contents_and_maybe_box() };
             } else {
                 self.meta().thread_id.set(None);
@@ -522,10 +618,9 @@ impl TypeMap {
             let mut old;
             let mut new;
             loop {
-                old = value.meta_outer().shared.load(Ordering::AcqRel);
+                old = value.meta_outer().shared.load(Ordering::Acquire);
                 new = old;
-                new.counter += value.meta_outer().biased_counter.get() as i32;
-
+                new.update_counter(|x| x + value.meta_outer().biased_counter.get() as i32);
                 new.set_merged(true);
 
                 if value
@@ -538,7 +633,7 @@ impl TypeMap {
                 }
             }
 
-            if new.counter == 0 {
+            if new.get_counter() == 0 {
                 println!("invoking the destructor");
                 unsafe { value.drop_contents_and_maybe_box_outer() };
             } else {
@@ -1036,7 +1131,7 @@ impl<T> BiasedRc<T> {
     fn try_unwrap_internal_same_thread(this: Self) -> Result<T, Self> {
         let meta = this.meta();
         let old = meta.shared.load(Ordering::Relaxed);
-        if old.counter != 0 {
+        if old.get_counter() != 0 {
             Err(this)
         } else {
             meta.thread_id.set(None);
@@ -1065,8 +1160,8 @@ impl<T> BiasedRc<T> {
         old = meta.shared.load(Ordering::Relaxed);
         new = old;
 
-        old.counter = 1;
-        new.counter = 0;
+        old.set_counter(1);
+        new.set_counter(0);
 
         if meta
             .shared
