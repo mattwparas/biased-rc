@@ -8,7 +8,7 @@ use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::NonNull;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{LazyLock, Mutex};
 use std::{cell::Cell, sync::atomic::Ordering};
 
@@ -72,10 +72,120 @@ impl PartialEq for ThreadId {
     }
 }
 
+/// An [`Option`]`<`[`ThreadId`]`>` which can be safely shared between threads.
+///
+/// **Note:** Currently implemented as a wrapper around [`AtomicUsize`].
+#[derive(Debug)]
+#[repr(transparent)]
+pub(crate) struct AtomicOptionThreadId(core::sync::atomic::AtomicUsize);
+
+/// Converts the internal representation in [`AtomicOptionThreadId`] into
+/// `Some(ThreadId)` or `None`.
+///
+/// This should only be a type-level conversion and a noop at runtime.
+#[inline(always)]
+fn wrap(value: usize) -> Option<ThreadId> {
+    match value {
+        0 => None,
+        n => Some(ThreadId::new(n.try_into().unwrap())),
+    }
+}
+
+/// Converts an `Option<ThreadId>` into the internal representation for
+/// [`AtomicOptionThreadId`].
+///
+/// This should only be a type-level conversion and a noop at runtime.
+#[inline(always)]
+const fn unwrap(value: Option<ThreadId>) -> usize {
+    match value {
+        None => 0,
+        Some(id) => id.0.get(),
+    }
+}
+
+impl AtomicOptionThreadId {
+    /// Creates a new `AtomicOptionThreadId`.
+    #[inline]
+    pub const fn new(id: Option<ThreadId>) -> Self {
+        Self(AtomicUsize::new(unwrap(id)))
+    }
+
+    /// Loads a value from the atomic.
+    ///
+    /// The [`Ordering`] may only be `SeqCst`, `Acquire` or `Relaxed`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `order` is `Release` or `AcqRel`.
+    #[inline]
+    pub fn load(&self, order: Ordering) -> Option<ThreadId> {
+        wrap(self.0.load(order))
+    }
+
+    /// Stores a value into the atomic.
+    ///
+    /// The [`Ordering`] may only be `SeqCst`, `Release` or `Relaxed`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `order` is `Acquire` or `AcqRel`.
+    #[inline]
+    pub fn store(&self, val: Option<ThreadId>, order: Ordering) {
+        self.0.store(unwrap(val), order);
+    }
+
+    /// Stores `new` into the atomic iff the currently stored value is `None`.
+    ///
+    /// The success ordering may be any [`Ordering`], but `failure` may only be
+    /// `SeqCst`, `Release` or `Relaxed` and must be equivalent to or weaker than
+    /// `success`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `failure` is `Acquire`, `AcqRel` or a stronger ordering than
+    /// `success`.
+    #[inline]
+    pub fn store_if_none(
+        &self,
+        new: Option<ThreadId>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Option<ThreadId>, Option<ThreadId>> {
+        self.0
+            .compare_exchange(unwrap(None), unwrap(new), success, failure)
+            .map(wrap)
+            .map_err(wrap)
+    }
+}
+
+impl Default for AtomicOptionThreadId {
+    /// Creates an `AtomicOptionThreadId` initialized to [`None`].
+    #[inline]
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl From<ThreadId> for AtomicOptionThreadId {
+    /// Converts a [`ThreadId`] into an `AtomicOptionThreadId`, wrapping it in [`Some`].
+    #[inline]
+    fn from(id: ThreadId) -> Self {
+        Self::new(Some(id))
+    }
+}
+
+impl From<Option<ThreadId>> for AtomicOptionThreadId {
+    /// Converts an [`Option`]`<`[`ThreadId`]`>` into an `AtomicOptionThreadId`.
+    #[inline]
+    fn from(id: Option<ThreadId>) -> Self {
+        Self::new(id)
+    }
+}
+
 // Okay, now that this appears to be working, we
 // need to shrink this down as much as possible.
 pub struct RcWord {
-    thread_id: Cell<Option<ThreadId>>,
+    thread_id: AtomicOptionThreadId,
     biased_counter: Cell<u32>,
     shared: SharedPacked,
 }
@@ -284,7 +394,7 @@ pub struct RcBox<T: ?Sized> {
 impl RcWord {
     pub fn new() -> Self {
         Self {
-            thread_id: Cell::new(Some(ThreadId::current_thread())),
+            thread_id: AtomicOptionThreadId::new(Some(ThreadId::current_thread())),
             biased_counter: Cell::new(1),
             shared: SharedPacked::new(),
         }
@@ -301,7 +411,7 @@ pub enum DecrementAction {
 impl<T: ?Sized> RcBox<T> {
     // TODO: Lift this to the Obj struct that eventually gets made
     pub fn increment(&self) {
-        let owner_tid = self.rcword.thread_id.get();
+        let owner_tid = self.rcword.thread_id.load(Ordering::Relaxed);
         let my_tid = ThreadId::current_thread();
 
         if owner_tid == Some(my_tid) {
@@ -341,7 +451,7 @@ impl<T: ?Sized> RcBox<T> {
     }
 
     pub fn decrement(&self) -> DecrementAction {
-        let owner_tid = self.rcword.thread_id.get();
+        let owner_tid = self.rcword.thread_id.load(Ordering::Relaxed);
         let my_tid = ThreadId::current_thread();
 
         if owner_tid == Some(my_tid) {
@@ -376,7 +486,7 @@ impl<T: ?Sized> RcBox<T> {
         if new.get_counter() == 0 {
             DecrementAction::Deallocate
         } else {
-            self.rcword.thread_id.set(None);
+            self.rcword.thread_id.store(None, Ordering::Relaxed);
 
             DecrementAction::DoNothing
         }
@@ -390,8 +500,6 @@ impl<T: ?Sized> RcBox<T> {
             new = old;
 
             new.update_counter(|x| x - 1);
-
-            println!("Slow decrement: {:?}", new);
 
             if new.get_counter() < 0 {
                 new.set_queued(true);
@@ -412,7 +520,7 @@ impl<T: ?Sized> RcBox<T> {
         } else if new.get_merged() && new.get_counter() == 0 {
             DecrementAction::Deallocate
         } else {
-            DecrementAction::Deallocate
+            DecrementAction::DoNothing
         }
     }
 
@@ -422,7 +530,7 @@ impl<T: ?Sized> RcBox<T> {
         let mut count = word.get_counter();
 
         if word.get_counter() == 0 {
-            let owner = self.rcword.thread_id.get();
+            let owner = self.rcword.thread_id.load(Ordering::Relaxed);
             match owner {
                 None => {}
                 Some(tid) if tid == ThreadId::current_thread() => {
@@ -477,7 +585,7 @@ impl<T: ?Sized> BiasedMerge for BiasedRc<T> {
             if new.get_counter() == 0 {
                 unsafe { self.drop_contents_and_maybe_box() };
             } else {
-                self.meta().thread_id.set(None);
+                self.meta().thread_id.store(None, Ordering::Relaxed);
             }
         }
 
@@ -501,7 +609,7 @@ impl TypeMap {
     }
 
     pub fn enqueue<T: ?Sized + 'static>(value: &BiasedRc<T>) {
-        let key = value.meta().thread_id.get();
+        let key = value.meta().thread_id.load(Ordering::Relaxed);
         let mut guard = QUEUE.lock().unwrap();
 
         if let Some(q) = guard.map.get_mut(&key) {
@@ -558,7 +666,7 @@ impl TypeMap {
                 println!("invoking the destructor");
                 unsafe { value.drop_contents_and_maybe_box_outer() };
             } else {
-                value.meta_outer().thread_id.set(None);
+                value.meta_outer().thread_id.store(None, Ordering::Relaxed);
             }
 
             drop(value);
@@ -846,6 +954,25 @@ pub struct BiasedRc<T: ?Sized + 'static> {
     phantom2: PhantomData<T>,
 }
 
+impl<T: ?Sized + Clone> BiasedRc<T> {
+    #[must_use]
+    pub fn make_mut(this: &mut Self) -> &mut T {
+        if !this.get_box().has_unique_ref() {
+            // Another pointer exists; clone
+            *this = Self::new(T::clone(this));
+        }
+
+        unsafe {
+            // This unsafety is ok because we're guaranteed that the pointer
+            // returned is the *only* pointer that will ever be returned to T. Our
+            // reference count is guaranteed to be 1 at this point, and we required
+            // the Arc itself to be `mut`, so we're returning the only possible
+            // reference to the inner data.
+            Self::get_mut_unchecked(this)
+        }
+    }
+}
+
 impl<T: ?Sized> BiasedRc<T> {
     #[inline(always)]
     fn from_inner(ptr: NonNull<RcBox<T>>) -> Self {
@@ -1032,7 +1159,7 @@ impl<T> BiasedRc<T> {
     }
 
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
-        let owner = this.meta().thread_id.get();
+        let owner = this.meta().thread_id.load(Ordering::Relaxed);
         match owner {
             None => Self::try_unwrap_internal(this),
             Some(tid) if tid == ThreadId::current_thread() => {
@@ -1055,7 +1182,7 @@ impl<T> BiasedRc<T> {
         if old.get_counter() != 0 {
             Err(this)
         } else {
-            meta.thread_id.set(None);
+            // meta.thread_id.store(None, Ordering::Relaxed);
             let copy = unsafe { ptr::read(Self::as_ptr(&this)) };
 
             // Deallocate the box?
@@ -1091,9 +1218,8 @@ impl<T> BiasedRc<T> {
         {
             Err(this)
         } else {
-            meta.thread_id.set(None);
+            // meta.thread_id.store(None, Ordering::Relaxed);
             let copy = unsafe { ptr::read(Self::as_ptr(&this)) };
-
             // Deallocate the box?
             unsafe { RcBox::dealloc(this.ptr) };
 
@@ -1388,4 +1514,18 @@ fn test_try_unwrap_impl_moved_thread() {
     // thread.join().unwrap();
 
     // TypeMap::run_explicit_merge();
+}
+
+#[test]
+fn try_unwrap_data_race() {
+    let a = BiasedRc::new(0);
+    let b = a.clone();
+
+    std::thread::spawn(move || {
+        let _value = b;
+    });
+
+    std::thread::spawn(move || {
+        BiasedRc::try_unwrap(a).unwrap();
+    });
 }
