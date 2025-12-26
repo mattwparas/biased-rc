@@ -12,9 +12,6 @@ use std::sync::atomic::AtomicU32;
 use std::sync::{LazyLock, Mutex};
 use std::{cell::Cell, sync::atomic::Ordering};
 
-use atomic::Atomic;
-use bytemuck::NoUninit;
-
 use core::convert::TryInto;
 use core::num::NonZeroUsize;
 
@@ -80,58 +77,7 @@ impl PartialEq for ThreadId {
 pub struct RcWord {
     thread_id: Cell<Option<ThreadId>>,
     biased_counter: Cell<u32>,
-    // shared: Atomic<Shared>,
     shared: SharedPacked,
-}
-
-#[repr(C, packed)]
-#[derive(Copy, Clone, PartialEq, Eq, NoUninit, Debug)]
-pub struct Shared {
-    counter: i32,
-    merged: bool,
-    queued: bool,
-    _align: [i8; 2],
-}
-
-impl Shared {
-    fn new() -> Self {
-        Self {
-            counter: 0,
-            merged: false,
-            queued: false,
-            _align: Default::default(),
-        }
-    }
-
-    #[inline(always)]
-    fn set_queued(&mut self, queued: bool) {
-        self.queued = queued;
-    }
-
-    #[inline(always)]
-    fn set_merged(&mut self, merged: bool) {
-        self.merged = merged;
-    }
-
-    fn get_queued(&self) -> bool {
-        self.queued
-    }
-
-    fn get_merged(&self) -> bool {
-        self.merged
-    }
-
-    fn update_counter(&mut self, f: impl FnOnce(i32) -> i32) {
-        self.counter = (f)(self.counter);
-    }
-
-    fn set_counter(&mut self, counter: i32) {
-        self.counter = counter;
-    }
-
-    fn get_counter(&self) -> i32 {
-        self.counter
-    }
 }
 
 pub struct SharedPacked(AtomicU32);
