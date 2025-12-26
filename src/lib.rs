@@ -79,7 +79,7 @@ impl PartialEq for ThreadId {
 // need to shrink this down as much as possible.
 pub struct RcWord {
     thread_id: Cell<Option<ThreadId>>,
-    biased_counter: Cell<usize>,
+    biased_counter: Cell<u32>,
     shared: Atomic<Shared>,
 }
 
@@ -92,7 +92,45 @@ pub struct Shared {
     _align: [i8; 2],
 }
 
+impl Shared {
+    #[inline(always)]
+    fn set_queued(&mut self, queued: bool) {
+        self.queued = queued;
+    }
+
+    #[inline(always)]
+    fn set_merged(&mut self, merged: bool) {
+        self.merged = merged;
+    }
+
+    fn get_queued(&self) -> bool {
+        self.queued
+    }
+
+    fn get_merged(&self) -> bool {
+        self.merged
+    }
+}
+
 pub struct SharedPacked(AtomicU32);
+
+impl SharedPacked {
+    #[inline]
+    pub fn load(&self, order: Ordering) -> u32 {
+        self.0.load(order)
+    }
+
+    #[inline]
+    pub fn compare_exchange(
+        &self,
+        current: u32,
+        new: u32,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u32, u32> {
+        self.0.compare_exchange(current, new, success, failure)
+    }
+}
 
 pub const FLAG_MERGED: u32 = 1 << 31;
 pub const FLAG_QUEUED: u32 = 1 << 30;
@@ -100,6 +138,54 @@ pub const FLAG_QUEUED: u32 = 1 << 30;
 const VALUE_BITS: u32 = 30;
 const VALUE_MASK: u32 = (1 << VALUE_BITS) - 1;
 const VALUE_SIGN_BIT: u32 = 1 << (VALUE_BITS - 1);
+
+pub struct Packed(u32);
+
+impl Packed {
+    pub fn set_queued(&mut self, queued: bool) {
+        let mask = FLAG_QUEUED;
+        if queued {
+            self.0 |= mask;
+        } else {
+            self.0 &= !mask
+        }
+    }
+
+    pub fn set_merged(&mut self, merged: bool) {
+        let mask = FLAG_MERGED;
+        if merged {
+            self.0 |= mask
+        } else {
+            self.0 &= !mask
+        }
+    }
+
+    pub fn get_merged(&self) -> bool {
+        self.is_merged()
+    }
+
+    pub fn get_queued(&self) -> bool {
+        self.is_queued()
+    }
+
+    pub fn is_merged(&self) -> bool {
+        self.0 & FLAG_MERGED != 0
+    }
+
+    pub fn is_queued(&self) -> bool {
+        self.0 & FLAG_QUEUED != 0
+    }
+
+    pub fn value(&self) -> u32 {
+        self.0 & VALUE_MASK
+    }
+
+    fn set_value(&mut self, value: i32) {
+        assert!(value >= -(1 << 29) && value < (1 << 29));
+        let v = (value as u32) & VALUE_MASK;
+        self.0 = (self.0 & !VALUE_MASK) | v;
+    }
+}
 
 impl SharedPacked {
     pub fn set_flag_queued(&self, queued: bool) {
@@ -111,30 +197,30 @@ impl SharedPacked {
         }
     }
 
-    pub fn set_flag_masked(&self, masked: bool) {
-        let mask = FLAG_QUEUED;
-        if masked {
+    pub fn set_flag_merged(&self, merged: bool) {
+        let mask = FLAG_MERGED;
+        if merged {
             self.0.fetch_or(mask, Ordering::Relaxed);
         } else {
             self.0.fetch_and(!mask, Ordering::Relaxed);
         }
     }
 
-    // fn new(value: i32, flag_a: bool, flag_b: bool) -> Self {
-    //     // Ensure value fits in signed 30 bits
-    //     assert!(value >= -(1 << 29) && value < (1 << 29));
+    fn new(value: i32, merged: bool, queued: bool) -> Self {
+        // Ensure value fits in signed 30 bits
+        assert!(value >= -(1 << 29) && value < (1 << 29));
 
-    //     let mut bits = (value as u32) & VALUE_MASK;
+        let mut bits = (value as u32) & VALUE_MASK;
 
-    //     if flag_a {
-    //         bits |= FLAG_A;
-    //     }
-    //     if flag_b {
-    //         bits |= FLAG_B;
-    //     }
+        if merged {
+            bits |= FLAG_MERGED;
+        }
+        if queued {
+            bits |= FLAG_QUEUED;
+        }
 
-    //     Packed(bits)
-    // }
+        SharedPacked(AtomicU32::new(bits))
+    }
 
     // /// Get the signed 30-bit value (sign-extended)
     // fn value(self) -> i32 {
@@ -153,10 +239,6 @@ impl SharedPacked {
     //     let v = (value as u32) & VALUE_MASK;
     //     self.0 = (self.0 & !VALUE_MASK) | v;
     // }
-
-    pub fn toggle_flag_a(&mut self) {
-        self.0.fetch_xor(FLAG_MERGED, Ordering::Relaxed);
-    }
 
     pub fn is_merged(&self) -> bool {
         self.0.fetch_and(FLAG_MERGED, Ordering::Relaxed) != 0
@@ -214,7 +296,8 @@ impl<T: ?Sized> RcBox<T> {
 
     pub fn fast_increment(&self) {
         let counter = self.rcword.biased_counter.get();
-        if counter == usize::MAX {
+
+        if counter == u32::MAX {
             panic!("reference counter overflow");
         }
         self.rcword.biased_counter.set(counter + 1);
@@ -261,7 +344,7 @@ impl<T: ?Sized> RcBox<T> {
         loop {
             let old = self.rcword.shared.load(Ordering::Relaxed);
             new = old;
-            new.merged = true;
+            new.set_merged(true);
             if self
                 .rcword
                 .shared
@@ -293,7 +376,7 @@ impl<T: ?Sized> RcBox<T> {
             println!("Slow decrement: {:?}", new);
 
             if new.counter < 0 {
-                new.queued = true;
+                new.set_queued(true);
             }
 
             if self
@@ -306,9 +389,9 @@ impl<T: ?Sized> RcBox<T> {
             }
         }
 
-        if old.queued != new.queued {
+        if old.get_queued() != new.get_queued() {
             DecrementAction::Queue
-        } else if new.merged && new.counter == 0 {
+        } else if new.get_merged() && new.counter == 0 {
             DecrementAction::Deallocate
         } else {
             DecrementAction::Deallocate
@@ -362,7 +445,8 @@ impl<T: ?Sized> BiasedMerge for BiasedRc<T> {
             old = self.meta().shared.load(Ordering::AcqRel);
             new = old;
             new.counter += self.meta().biased_counter.get() as i32;
-            new.merged = true;
+
+            new.set_merged(true);
 
             if self
                 .meta()
@@ -441,7 +525,8 @@ impl TypeMap {
                 old = value.meta_outer().shared.load(Ordering::AcqRel);
                 new = old;
                 new.counter += value.meta_outer().biased_counter.get() as i32;
-                new.merged = true;
+
+                new.set_merged(true);
 
                 if value
                     .meta_outer()
