@@ -1539,3 +1539,39 @@ fn try_unwrap_data_race() {
         BiasedRc::try_unwrap(a).unwrap();
     });
 }
+
+#[test]
+fn try_unwrap_data_race_sleep() {
+    // Exists to be exercised by Miri to check for data races.
+    let a = BiasedRc::new(0);
+    let b = a.clone();
+    let t1 = std::thread::spawn(move || {
+        let _value = *b;
+    });
+    let t2 = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(_) = BiasedRc::try_unwrap(a) {
+            // u += 1;
+        }
+    });
+    t1.join().unwrap();
+    t2.join().unwrap();
+}
+
+#[test]
+fn get_mut_data_race_sleep() {
+    // Exists to be exercised by Miri to check for data races.
+    let mut a = BiasedRc::new(0);
+    let b = a.clone();
+    let t1 = std::thread::spawn(move || {
+        let _value = *b;
+    });
+    let t2 = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Some(u) = BiasedRc::get_mut(&mut a) {
+            *u += 1;
+        }
+    });
+    t1.join().unwrap();
+    t2.join().unwrap();
+}
