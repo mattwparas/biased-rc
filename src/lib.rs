@@ -202,7 +202,7 @@ impl Packed {
         Self(bits)
     }
 
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self::new_with(0, false, false)
     }
 }
@@ -259,30 +259,8 @@ impl SharedPacked {
     }
 
     fn new() -> Self {
-        Self::new_with(0, false, false)
+        SharedPacked(AtomicU32::new(Packed::new_with(0, false, false).0))
     }
-
-    fn new_with(value: i32, merged: bool, queued: bool) -> Self {
-        SharedPacked(AtomicU32::new(Packed::new_with(value, merged, queued).0))
-    }
-
-    // /// Get the signed 30-bit value (sign-extended)
-    // fn value(self) -> i32 {
-    //     let raw = self.0 & VALUE_MASK;
-
-    //     if raw & VALUE_SIGN_BIT != 0 {
-    //         // Sign-extend from bit 29
-    //         (raw | !VALUE_MASK) as i32
-    //     } else {
-    //         raw as i32
-    //     }
-    // }
-
-    // fn set_value(&mut self, value: i32) {
-    //     assert!(value >= -(1 << 29) && value < (1 << 29));
-    //     let v = (value as u32) & VALUE_MASK;
-    //     self.0 = (self.0 & !VALUE_MASK) | v;
-    // }
 
     pub fn is_merged(&self) -> bool {
         self.0.fetch_and(FLAG_MERGED, Ordering::Relaxed) != 0
@@ -308,9 +286,6 @@ impl RcWord {
         Self {
             thread_id: Cell::new(Some(ThreadId::current_thread())),
             biased_counter: Cell::new(1),
-
-            // Change this to be the shared packed version
-            // shared: Atomic::new(Shared::new()),
             shared: SharedPacked::new(),
         }
     }
