@@ -8,6 +8,7 @@ use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::NonNull;
+use std::sync::atomic::AtomicU32;
 use std::sync::{LazyLock, Mutex};
 use std::{cell::Cell, sync::atomic::Ordering};
 
@@ -74,6 +75,8 @@ impl PartialEq for ThreadId {
     }
 }
 
+// Okay, now that this appears to be working, we
+// need to shrink this down as much as possible.
 pub struct RcWord {
     thread_id: Cell<Option<ThreadId>>,
     biased_counter: Cell<usize>,
@@ -87,6 +90,85 @@ pub struct Shared {
     merged: bool,
     queued: bool,
     _align: [i8; 2],
+}
+
+pub struct SharedPacked(AtomicU32);
+
+pub const FLAG_MERGED: u32 = 1 << 31;
+pub const FLAG_QUEUED: u32 = 1 << 30;
+
+const VALUE_BITS: u32 = 30;
+const VALUE_MASK: u32 = (1 << VALUE_BITS) - 1;
+const VALUE_SIGN_BIT: u32 = 1 << (VALUE_BITS - 1);
+
+impl SharedPacked {
+    pub fn set_flag_queued(&self, queued: bool) {
+        let mask = FLAG_QUEUED;
+        if queued {
+            self.0.fetch_or(mask, Ordering::Relaxed);
+        } else {
+            self.0.fetch_and(!mask, Ordering::Relaxed);
+        }
+    }
+
+    pub fn set_flag_masked(&self, masked: bool) {
+        let mask = FLAG_QUEUED;
+        if masked {
+            self.0.fetch_or(mask, Ordering::Relaxed);
+        } else {
+            self.0.fetch_and(!mask, Ordering::Relaxed);
+        }
+    }
+
+    // fn new(value: i32, flag_a: bool, flag_b: bool) -> Self {
+    //     // Ensure value fits in signed 30 bits
+    //     assert!(value >= -(1 << 29) && value < (1 << 29));
+
+    //     let mut bits = (value as u32) & VALUE_MASK;
+
+    //     if flag_a {
+    //         bits |= FLAG_A;
+    //     }
+    //     if flag_b {
+    //         bits |= FLAG_B;
+    //     }
+
+    //     Packed(bits)
+    // }
+
+    // /// Get the signed 30-bit value (sign-extended)
+    // fn value(self) -> i32 {
+    //     let raw = self.0 & VALUE_MASK;
+
+    //     if raw & VALUE_SIGN_BIT != 0 {
+    //         // Sign-extend from bit 29
+    //         (raw | !VALUE_MASK) as i32
+    //     } else {
+    //         raw as i32
+    //     }
+    // }
+
+    // fn set_value(&mut self, value: i32) {
+    //     assert!(value >= -(1 << 29) && value < (1 << 29));
+    //     let v = (value as u32) & VALUE_MASK;
+    //     self.0 = (self.0 & !VALUE_MASK) | v;
+    // }
+
+    pub fn toggle_flag_a(&mut self) {
+        self.0.fetch_xor(FLAG_MERGED, Ordering::Relaxed);
+    }
+
+    pub fn is_merged(&self) -> bool {
+        self.0.fetch_and(FLAG_MERGED, Ordering::Relaxed) != 0
+    }
+
+    pub fn is_queued(&self) -> bool {
+        self.0.fetch_and(FLAG_QUEUED, Ordering::Relaxed) != 0
+    }
+
+    pub fn value(&self) -> u32 {
+        self.0.fetch_and(VALUE_MASK, Ordering::Relaxed)
+    }
 }
 
 #[repr(C)]
@@ -660,7 +742,7 @@ fn set_ptr_value<T: ?Sized, U>(mut meta_ptr: *const T, addr_ptr: *mut U) -> *mut
 
 pub struct BiasedRc<T: ?Sized + 'static> {
     ptr: NonNull<RcBox<T>>,
-    phantom2: PhantomData<RcBox<T>>,
+    phantom2: PhantomData<T>,
 }
 
 impl<T: ?Sized> BiasedRc<T> {
@@ -1137,4 +1219,72 @@ fn test_queue_impl() {
     thread.join().unwrap();
 
     TypeMap::run_explicit_merge();
+}
+
+#[test]
+fn test_try_unwrap_impl_same_thread() {
+    #[derive(Debug)]
+    struct Foo {
+        foo: String,
+    }
+    impl Drop for Foo {
+        fn drop(&mut self) {
+            println!("Calling drop: {}", self.foo);
+        }
+    }
+    let value = BiasedRc::new(Foo {
+        foo: "hello world".to_string(),
+    });
+    let cloned = BiasedRc::clone(&value);
+
+    let failed_unwrap = BiasedRc::try_unwrap(value).unwrap_err();
+
+    drop(failed_unwrap);
+
+    assert!(BiasedRc::try_unwrap(cloned).is_ok());
+
+    // let thread = std::thread::spawn(move || {
+    //     drop(cloned);
+
+    //     // Run explicit merge:
+    //     TypeMap::run_explicit_merge();
+    // });
+
+    // thread.join().unwrap();
+
+    // TypeMap::run_explicit_merge();
+}
+
+#[test]
+fn test_try_unwrap_impl_moved_thread() {
+    #[derive(Debug)]
+    struct Foo {
+        foo: String,
+    }
+    impl Drop for Foo {
+        fn drop(&mut self) {
+            println!("Calling drop: {}", self.foo);
+        }
+    }
+    let value = BiasedRc::new(Foo {
+        foo: "hello world".to_string(),
+    });
+    let cloned = BiasedRc::clone(&value);
+
+    let failed_unwrap = BiasedRc::try_unwrap(value).unwrap_err();
+
+    drop(failed_unwrap);
+
+    assert!(BiasedRc::try_unwrap(cloned).is_ok());
+
+    // let thread = std::thread::spawn(move || {
+    //     drop(cloned);
+
+    //     // Run explicit merge:
+    //     TypeMap::run_explicit_merge();
+    // });
+
+    // thread.join().unwrap();
+
+    // TypeMap::run_explicit_merge();
 }
