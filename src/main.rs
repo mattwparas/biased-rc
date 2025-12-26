@@ -10,6 +10,7 @@ fn main() {
 
     let original = Rc::new(10);
     let now = Instant::now();
+
     for _ in 0..upper_bound {
         black_box({
             let foo = Rc::clone(&original);

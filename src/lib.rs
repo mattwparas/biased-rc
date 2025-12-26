@@ -1,10 +1,8 @@
 use std::alloc::Layout;
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::borrow::Borrow;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::hint::black_box;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
@@ -18,7 +16,6 @@ use bytemuck::NoUninit;
 
 use core::convert::TryInto;
 use core::num::NonZeroUsize;
-use core::sync::atomic::AtomicUsize;
 
 use std::{alloc, cmp, fmt, mem, ptr};
 
@@ -43,7 +40,7 @@ const SENITEL: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(usize::MAX) }
 /// thread local static variable for thread identification.
 ///
 /// [`as_u64()`]: std::thread::ThreadId::as_u64
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash, Eq)]
 #[repr(transparent)]
 pub(crate) struct ThreadId(pub(crate) NonZeroUsize);
 
@@ -74,116 +71,6 @@ impl PartialEq for ThreadId {
             (SENITEL, _) | (_, SENITEL) => false,
             (a, b) => a == b,
         }
-    }
-}
-
-/// An [`Option`]`<`[`ThreadId`]`>` which can be safely shared between threads.
-///
-/// **Note:** Currently implemented as a wrapper around [`AtomicUsize`].
-#[derive(Debug)]
-#[repr(transparent)]
-pub(crate) struct AtomicOptionThreadId(core::sync::atomic::AtomicUsize);
-
-/// Converts the internal representation in [`AtomicOptionThreadId`] into
-/// `Some(ThreadId)` or `None`.
-///
-/// This should only be a type-level conversion and a noop at runtime.
-#[inline(always)]
-fn wrap(value: usize) -> Option<ThreadId> {
-    match value {
-        0 => None,
-        n => Some(ThreadId::new(n.try_into().unwrap())),
-    }
-}
-
-/// Converts an `Option<ThreadId>` into the internal representation for
-/// [`AtomicOptionThreadId`].
-///
-/// This should only be a type-level conversion and a noop at runtime.
-#[inline(always)]
-const fn unwrap(value: Option<ThreadId>) -> usize {
-    match value {
-        None => 0,
-        Some(id) => id.0.get(),
-    }
-}
-
-impl AtomicOptionThreadId {
-    /// Creates a new `AtomicOptionThreadId`.
-    #[inline]
-    pub const fn new(id: Option<ThreadId>) -> Self {
-        Self(AtomicUsize::new(unwrap(id)))
-    }
-
-    /// Loads a value from the atomic.
-    ///
-    /// The [`Ordering`] may only be `SeqCst`, `Acquire` or `Relaxed`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `order` is `Release` or `AcqRel`.
-    #[inline]
-    pub fn load(&self, order: Ordering) -> Option<ThreadId> {
-        wrap(self.0.load(order))
-    }
-
-    /// Stores a value into the atomic.
-    ///
-    /// The [`Ordering`] may only be `SeqCst`, `Release` or `Relaxed`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `order` is `Acquire` or `AcqRel`.
-    #[inline]
-    pub fn store(&self, val: Option<ThreadId>, order: Ordering) {
-        self.0.store(unwrap(val), order);
-    }
-
-    /// Stores `new` into the atomic iff the currently stored value is `None`.
-    ///
-    /// The success ordering may be any [`Ordering`], but `failure` may only be
-    /// `SeqCst`, `Release` or `Relaxed` and must be equivalent to or weaker than
-    /// `success`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `failure` is `Acquire`, `AcqRel` or a stronger ordering than
-    /// `success`.
-    #[inline]
-    pub fn store_if_none(
-        &self,
-        new: Option<ThreadId>,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<Option<ThreadId>, Option<ThreadId>> {
-        self.0
-            .compare_exchange(unwrap(None), unwrap(new), success, failure)
-            .map(wrap)
-            .map_err(wrap)
-    }
-}
-
-impl Default for AtomicOptionThreadId {
-    /// Creates an `AtomicOptionThreadId` initialized to [`None`].
-    #[inline]
-    fn default() -> Self {
-        Self::new(None)
-    }
-}
-
-impl From<ThreadId> for AtomicOptionThreadId {
-    /// Converts a [`ThreadId`] into an `AtomicOptionThreadId`, wrapping it in [`Some`].
-    #[inline]
-    fn from(id: ThreadId) -> Self {
-        Self::new(Some(id))
-    }
-}
-
-impl From<Option<ThreadId>> for AtomicOptionThreadId {
-    /// Converts an [`Option`]`<`[`ThreadId`]`>` into an `AtomicOptionThreadId`.
-    #[inline]
-    fn from(id: Option<ThreadId>) -> Self {
-        Self::new(id)
     }
 }
 
@@ -337,9 +224,6 @@ impl<T: ?Sized> RcBox<T> {
             }
         }
 
-        dbg!(old);
-        dbg!(new);
-
         if old.queued != new.queued {
             DecrementAction::Queue
         } else if new.merged && new.counter == 0 {
@@ -349,20 +233,37 @@ impl<T: ?Sized> RcBox<T> {
         }
     }
 
-    pub fn queue(&self) {
-        // todo!()
-        // TODO:
-        // todo!()
+    // TODO: Figure out how to do this right?
+    fn has_unique_ref(&self) -> bool {
+        let word = self.rcword.shared.load(Ordering::AcqRel);
+        let mut count = word.counter;
+
+        if word.counter == 0 {
+            let owner = self.rcword.thread_id.get();
+            match owner {
+                None => {}
+                Some(tid) if tid == ThreadId::current_thread() => {
+                    count = self.rcword.biased_counter.get() as i32;
+                }
+                Some(_) => {
+                    count = 2;
+                }
+            }
+        }
+
+        count == 1
     }
 }
 
+pub struct Wrapper(Box<ManuallyDrop<dyn BiasedMerge>>);
+
+unsafe impl Send for Wrapper {}
+unsafe impl Sync for Wrapper {}
+
 #[derive(Default)]
 pub struct TypeMap {
-    inner: Vec<Box<ManuallyDrop<dyn BiasedMerge>>>,
-}
-
-thread_local! {
-    static TL_QUEUE: RefCell<TypeMap> = RefCell::new(TypeMap::default())
+    inner: Vec<Wrapper>,
+    map: HashMap<Option<ThreadId>, Vec<Wrapper>>,
 }
 
 pub trait BiasedMerge {
@@ -409,28 +310,49 @@ impl<T: ?Sized> BiasedMerge for BiasedRc<T> {
     }
 }
 
+pub static QUEUE: LazyLock<Mutex<TypeMap>> = LazyLock::new(|| Mutex::new(TypeMap::default()));
+
 impl TypeMap {
     pub fn insert<T: ?Sized + 'static>(&mut self, value: BiasedRc<T>) {
-        self.inner.push(Box::new(ManuallyDrop::new(value)));
+        self.inner.push(Wrapper(Box::new(ManuallyDrop::new(value))));
     }
 
     pub fn enqueue<T: ?Sized + 'static>(value: &BiasedRc<T>) {
-        println!("Enqueueing value");
-        TL_QUEUE.with_borrow_mut(|queue| queue.insert(BiasedRc::from_inner(value.ptr)))
+        let key = value.meta().thread_id.get();
+        let mut guard = QUEUE.lock().unwrap();
+
+        if let Some(q) = guard.map.get_mut(&key) {
+            q.push(Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(
+                value.ptr,
+            )))));
+        } else {
+            guard.map.insert(
+                key,
+                vec![Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(
+                    value.ptr,
+                ))))],
+            );
+        }
     }
 
     pub fn run_explicit_merge() {
-        TL_QUEUE.with_borrow_mut(|x| Self::explicit_merge(&mut x.inner));
+        QUEUE
+            .lock()
+            .unwrap()
+            .map
+            .get_mut(&Some(ThreadId::current_thread()))
+            .map(Self::explicit_merge);
     }
 
-    pub fn explicit_merge(values: &mut Vec<Box<ManuallyDrop<dyn BiasedMerge>>>) {
+    pub fn explicit_merge(values: &mut Vec<Wrapper>) {
         println!(
             "Running explicit merge on thread: {:?} with count: {}",
             std::thread::current().id(),
             values.len()
         );
 
-        for mut value in values.drain(..) {
+        for value in values.drain(..) {
+            let mut value = value.0;
             let mut old;
             let mut new;
             loop {
@@ -786,13 +708,11 @@ impl<T: ?Sized> BiasedRc<T> {
     #[must_use]
     #[inline]
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
-        todo!()
-
-        // if this.meta().has_unique_ref(!State::SHARED) {
-        //     unsafe { Some(Self::get_mut_unchecked(this)) }
-        // } else {
-        //     None
-        // }
+        if this.get_box().has_unique_ref() {
+            unsafe { Some(Self::get_mut_unchecked(this)) }
+        } else {
+            None
+        }
     }
 
     #[must_use]
@@ -821,7 +741,7 @@ impl<T: ?Sized> BiasedRc<T> {
 
     #[inline]
     pub fn ptr_eq(this: &Self, other: &BiasedRc<T>) -> bool {
-        this.ptr.as_ptr() == other.ptr.as_ptr()
+        std::ptr::eq(this.ptr.as_ptr(), other.ptr.as_ptr())
     }
 
     #[inline]
@@ -829,7 +749,7 @@ impl<T: ?Sized> BiasedRc<T> {
         // SAFETY: we are not moving anything and we don't expose any pointers.
         let this = unsafe { Self::pin_get_ref(this) };
         let other = unsafe { BiasedRc::<T>::pin_get_ref(other) };
-        this.ptr.as_ptr() == other.ptr.as_ptr()
+        std::ptr::eq(this.ptr.as_ptr(), other.ptr.as_ptr())
     }
 
     #[inline]
@@ -871,8 +791,6 @@ impl<T: ?Sized> BiasedRc<T> {
         unsafe {
             RcBox::dealloc(self.ptr);
         }
-
-        // todo!()
     }
 }
 
@@ -931,26 +849,39 @@ impl<T> BiasedRc<T> {
     }
 
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
-        // if State::SHARED {
-        //     Self::try_unwrap_internal(this)
-        // } else {
-        //     // If we may access the local counter, first check and decrement that one.
-        //     let local_count = this.meta().strong_local.get();
-        //     if local_count == 1 {
-        //         this.meta().strong_local.set(0);
-        //         match Self::try_unwrap_internal(this) {
-        //             Ok(result) => Ok(result),
-        //             Err(this) => {
-        //                 this.meta().strong_local.set(local_count);
-        //                 Err(this)
-        //             }
-        //         }
-        //     } else {
-        //         Err(this)
-        //     }
-        // }
+        let owner = this.meta().thread_id.get();
+        match owner {
+            None => Self::try_unwrap_internal(this),
+            Some(tid) if tid == ThreadId::current_thread() => {
+                let local_count = this.meta().biased_counter.get();
 
-        todo!()
+                if local_count == 1 {
+                    Self::try_unwrap_internal_same_thread(this)
+                } else {
+                    Err(this)
+                }
+            }
+            // Has an owner on a different thread.
+            Some(_) => Err(this),
+        }
+    }
+
+    fn try_unwrap_internal_same_thread(this: Self) -> Result<T, Self> {
+        let meta = this.meta();
+        let old = meta.shared.load(Ordering::Relaxed);
+        if old.counter != 0 {
+            Err(this)
+        } else {
+            meta.thread_id.set(None);
+            let copy = unsafe { ptr::read(Self::as_ptr(&this)) };
+
+            // Deallocate the box?
+            unsafe { RcBox::dealloc(this.ptr) };
+
+            mem::forget(this);
+
+            Ok(copy)
+        }
     }
 
     /// Returns the inner value, if this `HybridRc` is the only strong reference to it, assuming
@@ -959,31 +890,34 @@ impl<T> BiasedRc<T> {
     /// Used internally by `try_unwrap()`.
     #[inline]
     fn try_unwrap_internal(this: Self) -> Result<T, Self> {
-        // let meta = this.meta();
-        // // There is one implicit shared reference for all local references, so if there are no other
-        // // local references or we are a shared shared and the shared counter is 1, we are the only
-        // // strong reference left.
-        // if meta
-        //     .strong_shared
-        //     .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Relaxed)
-        //     .is_err()
-        // {
-        //     Err(this)
-        // } else {
-        //     // Relaxed should be enough, as `strong_shared` already hit 0, so no more
-        //     // Weak upgrading is possible.
-        //     meta.owner.store(None, Ordering::Relaxed);
+        let meta = this.meta();
+        let mut new;
+        let mut old;
 
-        //     let copy = unsafe { ptr::read(Self::as_ptr(&this)) };
+        // loop {
+        old = meta.shared.load(Ordering::Relaxed);
+        new = old;
 
-        //     // Make a weak pointer to clean up the remaining implicit weak reference
-        //     let _weak = Weak { ptr: this.ptr };
-        //     mem::forget(this);
+        old.counter = 1;
+        new.counter = 0;
 
-        //     Ok(copy)
-        // }
+        if meta
+            .shared
+            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            Err(this)
+        } else {
+            meta.thread_id.set(None);
+            let copy = unsafe { ptr::read(Self::as_ptr(&this)) };
 
-        todo!()
+            // Deallocate the box?
+            unsafe { RcBox::dealloc(this.ptr) };
+
+            mem::forget(this);
+
+            Ok(copy)
+        }
     }
 }
 
@@ -1181,14 +1115,16 @@ fn test_clone_impl() {
 #[test]
 fn test_queue_impl() {
     struct Foo {
-        foo: usize,
+        foo: String,
     }
     impl Drop for Foo {
         fn drop(&mut self) {
             println!("Calling drop: {}", self.foo);
         }
     }
-    let value = BiasedRc::new(Foo { foo: 10 });
+    let value = BiasedRc::new(Foo {
+        foo: "hello world".to_string(),
+    });
     let cloned = BiasedRc::clone(&value);
 
     let thread = std::thread::spawn(move || {
