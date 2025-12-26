@@ -185,7 +185,8 @@ impl From<Option<ThreadId>> for AtomicOptionThreadId {
 // Okay, now that this appears to be working, we
 // need to shrink this down as much as possible.
 pub struct RcWord {
-    thread_id: AtomicOptionThreadId,
+    // thread_id: AtomicOptionThreadId,
+    thread_id: Cell<Option<ThreadId>>,
     biased_counter: Cell<u32>,
     shared: SharedPacked,
 }
@@ -394,7 +395,8 @@ pub struct RcBox<T: ?Sized> {
 impl RcWord {
     pub fn new() -> Self {
         Self {
-            thread_id: AtomicOptionThreadId::new(Some(ThreadId::current_thread())),
+            // thread_id: AtomicOptionThreadId::new(Some(ThreadId::current_thread())),
+            thread_id: Cell::new(Some(ThreadId::current_thread())),
             biased_counter: Cell::new(1),
             shared: SharedPacked::new(),
         }
@@ -411,7 +413,8 @@ pub enum DecrementAction {
 impl<T: ?Sized> RcBox<T> {
     // TODO: Lift this to the Obj struct that eventually gets made
     pub fn increment(&self) {
-        let owner_tid = self.rcword.thread_id.load(Ordering::Relaxed);
+        // let owner_tid = self.rcword.thread_id.load(Ordering::Relaxed);
+        let owner_tid = self.rcword.thread_id.get();
         let my_tid = ThreadId::current_thread();
 
         if owner_tid == Some(my_tid) {
@@ -451,7 +454,8 @@ impl<T: ?Sized> RcBox<T> {
     }
 
     pub fn decrement(&self) -> DecrementAction {
-        let owner_tid = self.rcword.thread_id.load(Ordering::Relaxed);
+        // let owner_tid = self.rcword.thread_id.load(Ordering::Relaxed);
+        let owner_tid = self.rcword.thread_id.get();
         let my_tid = ThreadId::current_thread();
 
         if owner_tid == Some(my_tid) {
@@ -486,7 +490,8 @@ impl<T: ?Sized> RcBox<T> {
         if new.get_counter() == 0 {
             DecrementAction::Deallocate
         } else {
-            self.rcword.thread_id.store(None, Ordering::Relaxed);
+            // self.rcword.thread_id.store(None, Ordering::Relaxed);
+            self.rcword.thread_id.set(None);
 
             DecrementAction::DoNothing
         }
@@ -530,7 +535,8 @@ impl<T: ?Sized> RcBox<T> {
         let mut count = word.get_counter();
 
         if word.get_counter() == 0 {
-            let owner = self.rcword.thread_id.load(Ordering::Relaxed);
+            // let owner = self.rcword.thread_id.load(Ordering::Relaxed);
+            let owner = self.rcword.thread_id.get();
             match owner {
                 None => {}
                 Some(tid) if tid == ThreadId::current_thread() => {
@@ -585,7 +591,8 @@ impl<T: ?Sized> BiasedMerge for BiasedRc<T> {
             if new.get_counter() == 0 {
                 unsafe { self.drop_contents_and_maybe_box() };
             } else {
-                self.meta().thread_id.store(None, Ordering::Relaxed);
+                // self.meta().thread_id.store(None, Ordering::Relaxed);
+                self.meta().thread_id.set(None);
             }
         }
 
@@ -609,7 +616,8 @@ impl TypeMap {
     }
 
     pub fn enqueue<T: ?Sized + 'static>(value: &BiasedRc<T>) {
-        let key = value.meta().thread_id.load(Ordering::Relaxed);
+        // let key = value.meta().thread_id.load(Ordering::Relaxed);
+        let key = value.meta().thread_id.get();
         let mut guard = QUEUE.lock().unwrap();
 
         if let Some(q) = guard.map.get_mut(&key) {
@@ -666,7 +674,8 @@ impl TypeMap {
                 println!("invoking the destructor");
                 unsafe { value.drop_contents_and_maybe_box_outer() };
             } else {
-                value.meta_outer().thread_id.store(None, Ordering::Relaxed);
+                // value.meta_outer().thread_id.store(None, Ordering::Relaxed);
+                value.meta_outer().thread_id.set(None);
             }
 
             drop(value);
@@ -1159,7 +1168,8 @@ impl<T> BiasedRc<T> {
     }
 
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
-        let owner = this.meta().thread_id.load(Ordering::Relaxed);
+        // let owner = this.meta().thread_id.load(Ordering::Relaxed);
+        let owner = this.meta().thread_id.get();
         match owner {
             None => Self::try_unwrap_internal(this),
             Some(tid) if tid == ThreadId::current_thread() => {
