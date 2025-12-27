@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{LazyLock, Mutex};
+use std::thread::JoinHandle;
 use std::{cell::Cell, sync::atomic::Ordering};
 
 use core::convert::TryInto;
@@ -561,6 +562,22 @@ unsafe impl Sync for Wrapper {}
 pub struct TypeMap {
     inner: Vec<Wrapper>,
     map: HashMap<Option<ThreadId>, Vec<Wrapper>>,
+}
+
+/// The same as `std::thread::spawn`, however this will run
+/// an explicit merge on that thread when the given function
+/// exits.
+pub fn with_explicit_merge<F, T>(f: F) -> JoinHandle<T>
+where
+    F: FnOnce() -> T,
+    F: Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(|| {
+        let res = f();
+        TypeMap::run_explicit_merge();
+        res
+    })
 }
 
 pub trait BiasedMerge {
