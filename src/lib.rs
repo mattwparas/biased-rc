@@ -4,10 +4,10 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ops::Deref;
 use std::pin::Pin;
-use std::ptr::NonNull;
+use std::ptr::{NonNull, drop_in_place};
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{LazyLock, Mutex};
 use std::thread::JoinHandle;
@@ -16,7 +16,7 @@ use std::{cell::Cell, sync::atomic::Ordering};
 use core::convert::TryInto;
 use core::num::NonZeroUsize;
 
-use std::{alloc, cmp, fmt, mem, ptr};
+use std::{alloc, cmp, fmt, iter, mem, ptr};
 
 use std::hash::{Hash, Hasher};
 
@@ -1090,10 +1090,27 @@ impl<T: ?Sized> BiasedRc<T> {
 
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
-        // let meta = this.meta();
-        // meta.shared.load(Ordering::SeqCst).counter as usize + meta.biased_counter.get() - 1
+        let meta = this.meta();
 
-        todo!()
+        let word = meta.shared.load(Ordering::Acquire);
+        let mut count = word.get_counter();
+
+        // If the counter is 0, then we have to get the count from somewhere else
+        if word.get_counter() == 0 {
+            // let owner = self.rcword.thread_id.load(Ordering::Relaxed);
+            let owner = meta.thread_id.get();
+            match owner {
+                None => {}
+                Some(tid) if tid == ThreadId::current_thread() => {
+                    count = meta.biased_counter.get() as i32;
+                }
+                Some(_) => {
+                    count = 2;
+                }
+            }
+        }
+
+        count as _
     }
 
     /// Gets the approximate number of strong pointers to the pinned inner value.
@@ -1407,6 +1424,161 @@ impl<T: ?Sized> Unpin for BiasedRc<T> {}
 unsafe impl<T: ?Sized + Sync + Send> Send for BiasedRc<T> {}
 unsafe impl<T: ?Sized + Sync + Send> Sync for BiasedRc<T> {}
 
+impl<T> iter::FromIterator<T> for BiasedRc<[T]> {
+    fn from_iter<I: iter::IntoIterator<Item = T>>(iter: I) -> Self {
+        let vec: Vec<T> = iter.into_iter().collect();
+        vec.into()
+    }
+}
+
+impl<T> BiasedRc<[T]> {
+    /// Creates a new reference-counted slice with uninitialized contents.
+    #[inline]
+    pub fn new_uninit_slice(len: usize) -> BiasedRc<[mem::MaybeUninit<T>]> {
+        let inner = RcBox::allocate_slice(Self::build_new_meta(), len, false);
+        BiasedRc::from_inner(inner.into())
+    }
+
+    /// Creates a new reference-counted slice with uninitialized contents, with the memory being
+    /// filled with 0 bytes.
+    #[inline]
+    pub fn new_zeroed_slice(len: usize) -> BiasedRc<[mem::MaybeUninit<T>]> {
+        let inner = RcBox::allocate_slice(Self::build_new_meta(), len, true);
+        BiasedRc::from_inner(inner.into())
+    }
+
+    /// Copies the contents of a slice into a new `HybridRc`
+    ///
+    /// # Safety
+    /// Either `T` is `Copy` or the caller must guarantee that the the source doesn't drop its
+    /// contents.
+    #[inline]
+    unsafe fn copy_from_slice_unchecked(src: &[T]) -> Self {
+        let len = src.len();
+        let inner = RcBox::allocate_slice(Self::build_new_meta(), len, false);
+        let dest = ptr::addr_of_mut!((*inner).data).cast();
+
+        // Safety: The freshly allocated `RcBox` can't alias `src` and the payload can be fully
+        // initialized by copying the slice memory. The copying is also safe as long as the safety
+        // requirements for calling this are fulfilled.
+        unsafe {
+            src.as_ptr().copy_to_nonoverlapping(dest, src.len());
+            BiasedRc::from_inner(inner.assume_init().into())
+        }
+    }
+}
+
+impl<T: Copy> BiasedRc<[T]> {
+    #[inline]
+    pub fn copy_from_slice(src: &[T]) -> Self {
+        // Safety: `T` is `Copy`.
+        unsafe { Self::copy_from_slice_unchecked(src) }
+    }
+}
+
+#[must_use]
+pub(crate) struct SliceBuilder<'a, T> {
+    rcbox: &'a mut RcBox<[MaybeUninit<T>]>,
+    n_elems: usize,
+}
+
+impl<'a, T> SliceBuilder<'a, T> {
+    /// Constructs a new builder for a `RcBox<[T]>` with a slice length of `length`
+    #[inline]
+    pub fn new(meta: RcWord, length: usize) -> Self {
+        let rcbox = RcBox::<T>::allocate_slice(meta, length, false);
+        Self { rcbox, n_elems: 0 }
+    }
+
+    /// Fills the next free slot in the slice with `item`
+    #[inline]
+    pub fn append(&mut self, item: T) {
+        self.rcbox.data[self.n_elems].write(item);
+        self.n_elems += 1;
+    }
+
+    /// Consumes the builder and returns the initialized `RcBox<T>`
+    ///
+    /// The result is a mutable reference with arbitrary lifetime.
+    ///
+    /// # Panics
+    /// Panics if the number of appended elements doesn't match the promised length.
+    #[inline]
+    pub fn finish(self) -> &'a mut RcBox<[T]> {
+        assert_eq!(self.n_elems, self.rcbox.data.len());
+        let rcbox: *mut _ = self.rcbox;
+        std::mem::forget(self);
+        unsafe { (*rcbox).assume_init() }
+    }
+}
+
+impl<T> Drop for SliceBuilder<'_, T> {
+    /// Drops the already cloned elements and deallocates the temporary `RcBox`
+    ///
+    /// Only reached if the builder wasn't consumed by `finish`, which should only happen in
+    /// a panic unwind.
+    #[cold]
+    fn drop(&'_ mut self) {
+        let slice = &mut self.rcbox.data[..self.n_elems];
+        unsafe {
+            let slice: &mut [T] = &mut *(slice as *mut [MaybeUninit<T>] as *mut [T]);
+            drop_in_place(slice);
+        }
+        unsafe {
+            RcBox::dealloc(self.rcbox.into());
+        }
+    }
+}
+
+impl<T> From<T> for BiasedRc<T> {
+    #[inline]
+    fn from(src: T) -> Self {
+        Self::new(src)
+    }
+}
+
+impl<T: Clone> From<&[T]> for BiasedRc<[T]> {
+    #[inline]
+    fn from(src: &[T]) -> Self {
+        let mut builder = SliceBuilder::new(Self::build_new_meta(), src.len());
+        for item in src {
+            builder.append(Clone::clone(item));
+        }
+        Self::from_inner(builder.finish().into())
+    }
+}
+
+impl<T> From<Vec<T>> for BiasedRc<[T]> {
+    #[inline]
+    fn from(mut src: Vec<T>) -> Self {
+        unsafe {
+            let result = BiasedRc::<_>::copy_from_slice_unchecked(&src[..]);
+
+            // Set the length of `src`, so that the moved items are not dropped.
+            src.set_len(0);
+
+            result
+        }
+    }
+}
+
+impl From<&str> for BiasedRc<str> {
+    #[inline]
+    fn from(src: &str) -> Self {
+        let bytes = BiasedRc::<_>::copy_from_slice(src.as_bytes());
+        let inner = unsafe { (bytes.ptr.as_ptr() as *mut _ as *mut RcBox<str>).as_mut() }.unwrap();
+        mem::forget(bytes);
+        Self::from_inner(inner.into())
+    }
+}
+
+impl From<String> for BiasedRc<str> {
+    #[inline]
+    fn from(src: String) -> Self {
+        Self::from(&src[..])
+    }
+}
+
 #[test]
 fn does_this_work() {
     let value = BiasedRc::new(10);
@@ -1591,4 +1763,44 @@ fn get_mut_data_race_sleep() {
     });
     t1.join().unwrap();
     t2.join().unwrap();
+}
+
+thread_local! {
+    static DROP_COUNTER: Cell<usize> = Cell::new(0);
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Test(u8);
+impl Drop for Test {
+    fn drop(&mut self) {
+        DROP_COUNTER.with(|x| x.set(x.get() + 1));
+    }
+}
+impl Default for Test {
+    fn default() -> Self {
+        Test(1)
+    }
+}
+// Panicing clone to test cloning from slice error cases
+impl Clone for Test {
+    fn clone(&self) -> Self {
+        if self.0 == 0 {
+            panic!();
+        }
+        Self(self.0)
+    }
+}
+
+#[test]
+fn test_any() {
+    let a = BiasedRc::<Test>::new(Test(42));
+    let b: BiasedRc<dyn Any> = From::from(a.clone());
+    let c: BiasedRc<dyn Any + Send + Sync> = From::from(a);
+
+    assert!(b.clone().downcast::<usize>().is_err());
+    assert!(c.clone().downcast::<usize>().is_err());
+    let a = c.downcast::<Test>().unwrap();
+    assert_eq!(a.0, 42);
+    let b = b.downcast::<Test>().unwrap();
+    assert_eq!(b.0, 42);
 }
