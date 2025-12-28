@@ -20,6 +20,8 @@ use std::{alloc, cmp, fmt, iter, mem, ptr};
 
 use std::hash::{Hash, Hasher};
 
+use rustc_hash::FxHashMap;
+
 thread_local! {
     /// Zero-sized thread-local variable to differentiate threads.
     static THREAD_MARKER: () = ();
@@ -395,9 +397,12 @@ pub struct RcBox<T: ?Sized> {
 
 impl RcWord {
     pub fn new() -> Self {
+        let id = ThreadId::current_thread();
+
+        // debug_assert!(TypeMap::is_thread_registered(id));
+
         Self {
-            // thread_id: AtomicOptionThreadId::new(Some(ThreadId::current_thread())),
-            thread_id: Cell::new(Some(ThreadId::current_thread())),
+            thread_id: Cell::new(Some(id)),
             biased_counter: Cell::new(1),
             shared: SharedPacked::new(),
         }
@@ -561,7 +566,8 @@ unsafe impl Sync for Wrapper {}
 #[derive(Default)]
 pub struct TypeMap {
     inner: Vec<Wrapper>,
-    map: HashMap<Option<ThreadId>, Vec<Wrapper>>,
+    map: FxHashMap<Option<ThreadId>, Vec<Wrapper>>,
+    unregistered: FxHashMap<Option<ThreadId>, Vec<Wrapper>>,
 }
 
 /// The same as `std::thread::spawn`, however this will run
@@ -574,8 +580,9 @@ where
     T: Send + 'static,
 {
     std::thread::spawn(|| {
+        TypeMap::register_thread();
         let res = f();
-        TypeMap::run_explicit_merge();
+        TypeMap::finish_thread_merge();
         res
     })
 }
@@ -625,47 +632,105 @@ impl<T: ?Sized> BiasedMerge for BiasedRc<T> {
     }
 }
 
-pub static QUEUE: LazyLock<Mutex<TypeMap>> = LazyLock::new(|| Mutex::new(TypeMap::default()));
+pub static QUEUE: LazyLock<parking_lot::Mutex<TypeMap>> =
+    LazyLock::new(|| parking_lot::Mutex::new(TypeMap::default()));
+
+/// Registers the currently running thread with the queue collector.
+/// This isn't explicitly required; however if you do not
+pub fn register_thread() {
+    TypeMap::register_thread();
+}
 
 impl TypeMap {
-    pub fn insert<T: ?Sized + 'static>(&mut self, value: BiasedRc<T>) {
+    fn is_thread_registered(key: ThreadId) -> bool {
+        QUEUE.lock().map.contains_key(&Some(key))
+    }
+
+    pub fn insert_fallback<T: ?Sized + 'static>(&mut self, value: BiasedRc<T>) {
         self.inner.push(Wrapper(Box::new(ManuallyDrop::new(value))));
+    }
+
+    pub fn register_thread() {
+        let key = ThreadId::current_thread();
+        let mut guard = QUEUE.lock();
+
+        if !guard.map.contains_key(&Some(key)) {
+            guard.map.insert(Some(key), Vec::new());
+        }
     }
 
     pub fn enqueue<T: ?Sized + 'static>(value: &BiasedRc<T>) {
         // let key = value.meta().thread_id.load(Ordering::Relaxed);
         let key = value.meta().thread_id.get();
-        let mut guard = QUEUE.lock().unwrap();
+        let mut guard = QUEUE.lock();
 
+        // TODO: The thread ID needs to be registered once its created. Otherwise,
+        // this doesn't really work.
         if let Some(q) = guard.map.get_mut(&key) {
             q.push(Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(
                 value.ptr,
             )))));
         } else {
-            guard.map.insert(
-                key,
-                vec![Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(
+            if let Some(q) = guard.unregistered.get_mut(&key) {
+                q.push(Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(
                     value.ptr,
-                ))))],
-            );
+                )))));
+            } else {
+                guard.unregistered.insert(
+                    key,
+                    vec![Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(
+                        value.ptr,
+                    ))))],
+                );
+            }
+
+            // Fallback thread, for something that is unclaimed
+            // guard.insert_fallback(BiasedRc::from_inner(value.ptr));
         }
     }
 
-    pub fn run_explicit_merge() {
-        QUEUE
-            .lock()
-            .unwrap()
+    pub fn run_explicit_merge() -> usize {
+        let mut guard = QUEUE.lock();
+
+        let current = ThreadId::current_thread();
+
+        // Attempt to coalesce the unregistered queue, if its now registered:
+
+        let unregistered = guard
+            .unregistered
+            .get_mut(&Some(current))
+            .map(Self::explicit_merge)
+            .unwrap_or_default();
+
+        let registered = guard
             .map
             .get_mut(&Some(ThreadId::current_thread()))
-            .map(Self::explicit_merge);
+            .map(Self::explicit_merge)
+            .unwrap_or_default();
+
+        unregistered + registered
+
+        // ret + Self::explicit_merge(&mut guard.inner)
     }
 
-    pub fn explicit_merge(values: &mut Vec<Wrapper>) {
-        println!(
-            "Running explicit merge on thread: {:?} with count: {}",
-            std::thread::current().id(),
-            values.len()
-        );
+    pub fn finish_thread_merge() {
+        let mut guard = QUEUE.lock();
+        let id = ThreadId::current_thread();
+        let q = guard.map.remove(&Some(id));
+        let unregistered = guard.map.remove(&Some(id));
+        drop(guard);
+        q.map(|mut x| Self::explicit_merge(&mut x));
+        unregistered.map(|mut x| Self::explicit_merge(&mut x));
+    }
+
+    pub fn explicit_merge(values: &mut Vec<Wrapper>) -> usize {
+        // println!(
+        //     "Running explicit merge on thread: {:?} with count: {}",
+        //     std::thread::current().id(),
+        //     values.len()
+        // );
+
+        let ret = values.len();
 
         for value in values.drain(..) {
             let mut value = value.0;
@@ -697,6 +762,8 @@ impl TypeMap {
 
             drop(value);
         }
+
+        ret
     }
 }
 
@@ -1150,10 +1217,16 @@ impl<T: ?Sized> BiasedRc<T> {
 impl<T> BiasedRc<T> {
     #[inline]
     pub fn new(data: T) -> Self {
+        // register_thread();
         let mut inner = RcBox::allocate(Self::build_new_meta());
         let inner = unsafe { inner.as_mut() };
         inner.data.write(data);
         Self::from_inner(unsafe { inner.assume_init() }.into())
+    }
+
+    pub fn new_branded(data: T) -> Self {
+        register_thread();
+        Self::new(data)
     }
 
     /// Creates a new `HybridRc` with uninitialized contents.
@@ -1581,6 +1654,7 @@ impl From<String> for BiasedRc<str> {
 
 #[test]
 fn does_this_work() {
+    register_thread();
     let value = BiasedRc::new(10);
     println!("{}", value);
 }
@@ -1602,6 +1676,7 @@ fn test_drop_impl() {
 
 #[test]
 fn test_clone_impl() {
+    register_thread();
     struct Foo {
         foo: usize,
     }
@@ -1622,6 +1697,7 @@ fn test_clone_impl() {
 
 #[test]
 fn test_queue_impl() {
+    register_thread();
     struct Foo {
         foo: String,
     }
@@ -1803,4 +1879,67 @@ fn test_any() {
     assert_eq!(a.0, 42);
     let b = b.downcast::<Test>().unwrap();
     assert_eq!(b.0, 42);
+}
+
+/*
+From the paper:
+
+Lastly, when a thread terminates, it processes the objects re-
+maining in its QueuedObjects list, and de-registers itself from
+the QueuedObjects structure. Theoretically, an object can out-
+live its owner thread if its biased counter is positive, and has not
+been queued in the QueuedObjects list when the owner thread
+terminates. We handle this case as follows. When a non-owner
+thread makes the shared counter of an object negative, it first
+checks whether the object’s owner thread is alive by looking-up
+the QueuedObjects structure — which implicitly records the live
+threads. If the owner thread is not alive, the non-owner thread
+merges the counters instead of queuing the object, and either deal-
+locates the object or unbiases it
+*/
+#[test]
+fn test_moving_across_threads() {
+    let (sender, receiver) = std::sync::mpsc::channel::<BiasedRc<usize>>();
+
+    let (send_finish, receive_finish) = std::sync::mpsc::channel::<()>();
+
+    let start = std::thread::spawn(move || {
+        // register_thread();
+        let value = BiasedRc::new(0);
+        sender.send(value.clone()).unwrap();
+        receive_finish.recv().unwrap();
+
+        let _ = value.clone();
+        let _ = value.clone();
+
+        drop(value);
+    });
+
+    let value = receiver.recv().unwrap();
+    dbg!(value.get_box().rcword.biased_counter.get());
+    let meta = value.get_box().rcword.shared.load(Ordering::Relaxed);
+    dbg!(meta.get_merged());
+    dbg!(meta.get_queued());
+    dbg!(meta.get_counter());
+
+    // Okay, so now we're in the realm of a value which has escaped its
+    // owner thread, but the value has not been enqueued. At this point
+    // now it should be clear that the thread is dead, because we've marked it
+    // as such?
+    dbg!(value.get_box().rcword.thread_id.get() == Some(ThreadId::current_thread()));
+
+    drop(value);
+
+    send_finish.send(()).unwrap();
+
+    // Value should be on the thread:
+    let merged = TypeMap::run_explicit_merge();
+    start.join().unwrap();
+
+    println!("Unregistered queue:");
+    for (key, v) in QUEUE.lock().unregistered.iter() {
+        println!("{:?}: {}", key, v.len());
+    }
+
+    dbg!(merged);
 }

@@ -38,4 +38,31 @@ fn main() {
         });
     }
     println!("Hybrid clone + drop: {:?}", now.elapsed());
+
+    let now = Instant::now();
+    for _ in 0..upper_bound {
+        black_box({
+            let foo = BiasedRc::new_branded(10);
+            drop(foo);
+        })
+    }
+    println!("Allocation with registering: {:?}", now.elapsed());
+
+    let now = Instant::now();
+    for _ in 0..upper_bound {
+        black_box({
+            let foo = BiasedRc::new(10);
+            drop(foo);
+        })
+    }
+    println!("Allocation without registering: {:?}", now.elapsed());
+
+    let now = Instant::now();
+    for _ in 0..upper_bound {
+        black_box({
+            let foo = Arc::new(10);
+            drop(foo);
+        })
+    }
+    println!("Arc allocation: {:?}", now.elapsed());
 }
