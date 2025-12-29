@@ -37,7 +37,7 @@ fn main() {
             drop(foo);
         });
     }
-    println!("Hybrid clone + drop: {:?}", now.elapsed());
+    println!("biased clone + drop: {:?}", now.elapsed());
 
     let now = Instant::now();
     for _ in 0..upper_bound {

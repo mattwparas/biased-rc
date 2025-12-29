@@ -1083,15 +1083,12 @@ impl<T: ?Sized> BiasedRc<T> {
     /// Provides a reference to the inner value.
     #[inline(always)]
     fn data(&self) -> &T {
-        // Safety: as long as one HybridRc or Weak for this item exists, the memory stays allocated.
         unsafe { &(*self.ptr.as_ptr()).data }
     }
 
     /// Provides a reference to the shared metadata.
     #[inline(always)]
     fn meta(&self) -> &RcWord {
-        // todo!()
-        // Safety: as long as one HybridRc or Weak for this item exists, the memory stays allocated.
         unsafe { &(*self.ptr.as_ptr()).rcword }
     }
 
@@ -1194,13 +1191,6 @@ impl<T: ?Sized> BiasedRc<T> {
         RcWord::new()
     }
 
-    /// Drops the contained value and also drops the shared `RcBox` if there are no other `Weak`
-    /// references.
-    ///
-    /// # Safety
-    /// Only safe to use in `drop()` or a consuming function after verifying that no other strong
-    /// reference exists. Otherwise after calling this e.g. dereferencing the `HybridRc` WILL
-    /// cause undefined behaviour and even dropping it MAY cause undefined behaviour.
     unsafe fn drop_contents_and_maybe_box(&mut self) {
         // Safety: only called if this was the last strong reference
         unsafe {
@@ -1229,19 +1219,12 @@ impl<T> BiasedRc<T> {
         Self::new(data)
     }
 
-    /// Creates a new `HybridRc` with uninitialized contents.
     #[inline]
     pub fn new_uninit() -> BiasedRc<mem::MaybeUninit<T>> {
         let inner = RcBox::allocate(Self::build_new_meta());
         BiasedRc::from_inner(inner)
     }
 
-    /// Creates a new `HybridRc` with uninitialized contents, with the memory being filled with
-    /// 0 bytes.
-    ///
-    /// See [`MaybeUninit::zeroed()`] for examples of correct and incorrect usage of this method.
-    ///
-    /// [`MaybeUninit::zeroed()`]: mem::MaybeUninit::zeroed
     #[inline]
     pub fn new_zeroed() -> BiasedRc<mem::MaybeUninit<T>> {
         let mut inner = RcBox::allocate(Self::build_new_meta());
@@ -1249,8 +1232,6 @@ impl<T> BiasedRc<T> {
         BiasedRc::from_inner(inner)
     }
 
-    /// Creates a new `Pin<HybridRc<T>>`. If `T` does not implement `Unpin`, then `data` will be
-    /// pinned in memory and unable to be moved.
     #[inline]
     pub fn pin(data: T) -> Pin<Self> {
         unsafe { Pin::new_unchecked(Self::new(data)) }
@@ -1311,10 +1292,6 @@ impl<T> BiasedRc<T> {
         }
     }
 
-    /// Returns the inner value, if this `HybridRc` is the only strong reference to it, assuming
-    /// that there are no (other) local references to the value.
-    ///
-    /// Used internally by `try_unwrap()`.
     #[inline]
     fn try_unwrap_internal(this: Self) -> Result<T, Self> {
         let meta = this.meta();
@@ -1417,7 +1394,6 @@ impl<T: ?Sized + 'static> Drop for BiasedRc<T> {
 // Propagate some useful traits implemented by the inner type
 
 impl<T: Default> Default for BiasedRc<T> {
-    /// Creates a new `HybridRc`, with the `Default` value for `T`.
     #[inline]
     fn default() -> Self {
         Self::new(Default::default())
@@ -1425,10 +1401,6 @@ impl<T: Default> Default for BiasedRc<T> {
 }
 
 impl<T: ?Sized + PartialEq> PartialEq<BiasedRc<T>> for BiasedRc<T> {
-    /// Equality for `HybridRc`s.
-    ///
-    /// Two `HybridRc`s are equal if their inner values are equal, independent of if they are
-    /// stored in the same allocation.
     #[inline]
     fn eq(&self, other: &BiasedRc<T>) -> bool {
         **self == **other
@@ -1445,9 +1417,6 @@ impl<T: ?Sized + Hash> Hash for BiasedRc<T> {
 }
 
 impl<T: ?Sized + PartialOrd> PartialOrd<BiasedRc<T>> for BiasedRc<T> {
-    /// Partial comparison for `HybridRc`s.
-    ///
-    /// The two are compared by calling `partial_cmp()` on their inner values.
     #[inline]
     fn partial_cmp(&self, other: &BiasedRc<T>) -> Option<cmp::Ordering> {
         (**self).partial_cmp(&**other)
@@ -1455,9 +1424,6 @@ impl<T: ?Sized + PartialOrd> PartialOrd<BiasedRc<T>> for BiasedRc<T> {
 }
 
 impl<T: ?Sized + Ord> Ord for BiasedRc<T> {
-    /// Comparison for `HybridRc`s.
-    ///
-    /// The two are compared by calling `cmp()` on their inner values.
     #[inline]
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         (**self).cmp(&**other)
@@ -1478,20 +1444,12 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for BiasedRc<T> {
     }
 }
 
-// `HybridRc` can be formatted as a pointer.
 impl<T: ?Sized> fmt::Pointer for BiasedRc<T> {
-    /// Formats the value using the given formatter.
-    ///
-    /// If the `#` flag is used, the state (shared/local) is written after the address.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Pointer::fmt(&Self::as_ptr(self), f)
     }
 }
 
-/// `HybridRc<T>` is always `Unpin` itself, because the data value is on the heap,
-/// so moving `HybridRc<T>` doesn't move the content even if `T` is not `Unpin`.
-///
-/// This allows unpinning e.g. `Pin<Box<HybridRc<T>>>` but not any `Pin<HybridRc<T>>`!
 impl<T: ?Sized> Unpin for BiasedRc<T> {}
 
 unsafe impl<T: ?Sized + Sync + Send> Send for BiasedRc<T> {}
@@ -1520,11 +1478,6 @@ impl<T> BiasedRc<[T]> {
         BiasedRc::from_inner(inner.into())
     }
 
-    /// Copies the contents of a slice into a new `HybridRc`
-    ///
-    /// # Safety
-    /// Either `T` is `Copy` or the caller must guarantee that the the source doesn't drop its
-    /// contents.
     #[inline]
     unsafe fn copy_from_slice_unchecked(src: &[T]) -> Self {
         let len = src.len();
