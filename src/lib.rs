@@ -187,6 +187,8 @@ impl From<Option<ThreadId>> for AtomicOptionThreadId {
 
 // Okay, now that this appears to be working, we
 // need to shrink this down as much as possible.
+
+#[repr(C)]
 pub struct RcWord {
     // thread_id: AtomicOptionThreadId,
     thread_id: Cell<Option<ThreadId>>,
@@ -440,21 +442,51 @@ impl<T: ?Sized> RcBox<T> {
     }
 
     pub fn slow_increment(&self) {
+        // loop {
+        //     // TODO: Do some reading on the memory implications here
+        //     // Do we have to read the whole thing together?
+        //     let old = self.rcword.shared.load(Ordering::Relaxed);
+        //     let mut new = old;
+        //     new.update_counter(|x| x + 1);
+
+        //     if self
+        //         .rcword
+        //         .shared
+        //         .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
+        //         .is_ok()
+        //     {
+        //         break;
+        //     }
+        // }
+
+        // TODO: Use fetch update instead!
+        // self.rcword
+        //     .shared
+        //     .0
+        //     .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
+        //         let mut value = Packed(old);
+        //         value.update_counter(|x| x + 1);
+        //         Some(value.0)
+        //     });
+
+        let mut old = self.rcword.shared.load(Ordering::Relaxed);
+
         loop {
             // TODO: Do some reading on the memory implications here
             // Do we have to read the whole thing together?
-            let old = self.rcword.shared.load(Ordering::Relaxed);
+            // let old = self.rcword.shared.load(Ordering::Relaxed);
             let mut new = old;
-
             new.update_counter(|x| x + 1);
 
-            if self
+            match self
                 .rcword
                 .shared
                 .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
             {
-                break;
+                Ok(_) => break,
+                Err(e) => {
+                    old = Packed(e);
+                }
             }
         }
     }
@@ -479,17 +511,34 @@ impl<T: ?Sized> RcBox<T> {
 
         let mut new;
 
+        // loop {
+        //     let old = self.rcword.shared.load(Ordering::Relaxed);
+        //     new = old;
+        //     new.set_merged(true);
+        //     if self
+        //         .rcword
+        //         .shared
+        //         .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
+        //         .is_ok()
+        //     {
+        //         break;
+        //     }
+        // }
+
+        let mut old = self.rcword.shared.load(Ordering::Relaxed);
+
         loop {
-            let old = self.rcword.shared.load(Ordering::Relaxed);
             new = old;
             new.set_merged(true);
-            if self
+            match self
                 .rcword
                 .shared
                 .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
             {
-                break;
+                Ok(_) => break,
+                Err(e) => {
+                    old = Packed(e);
+                }
             }
         }
 
@@ -504,25 +553,47 @@ impl<T: ?Sized> RcBox<T> {
     }
 
     pub fn slow_decrement(&self) -> DecrementAction {
-        let mut old;
+        // let mut old;
+        // let mut new;
+        // loop {
+        //     old = self.rcword.shared.load(Ordering::Relaxed);
+        //     new = old;
+
+        //     new.update_counter(|x| x - 1);
+
+        //     if new.get_counter() < 0 {
+        //         new.set_queued(true);
+        //     }
+
+        //     if self
+        //         .rcword
+        //         .shared
+        //         .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
+        //         .is_ok()
+        //     {
+        //         break;
+        //     }
+        // }
+
+        let mut old = self.rcword.shared.load(Ordering::Relaxed);
         let mut new;
         loop {
-            old = self.rcword.shared.load(Ordering::Relaxed);
             new = old;
-
             new.update_counter(|x| x - 1);
 
             if new.get_counter() < 0 {
                 new.set_queued(true);
             }
 
-            if self
+            match self
                 .rcword
                 .shared
                 .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
             {
-                break;
+                Ok(_) => break,
+                Err(e) => {
+                    old = Packed(e);
+                }
             }
         }
 
@@ -595,29 +666,48 @@ pub trait BiasedMerge {
 
 impl<T: ?Sized> BiasedMerge for BiasedRc<T> {
     fn merge(mut self) {
-        let mut old;
+        // let mut old;
+        // let mut new;
+        // loop {
+        //     old = self.meta().shared.load(Ordering::Acquire);
+        //     new = old;
+        //     new.update_counter(|x| x + self.meta().biased_counter.get() as i32);
+        //     new.set_merged(true);
+
+        //     if self
+        //         .meta()
+        //         .shared
+        //         .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
+        //         .is_ok()
+        //     {
+        //         break;
+        //     }
+        // }
+
+        let mut old = self.meta().shared.load(Ordering::Acquire);
         let mut new;
         loop {
-            old = self.meta().shared.load(Ordering::Acquire);
             new = old;
             new.update_counter(|x| x + self.meta().biased_counter.get() as i32);
             new.set_merged(true);
 
-            if self
+            match self
                 .meta()
                 .shared
                 .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
             {
-                break;
+                Ok(_) => break,
+                Err(e) => {
+                    old = Packed(e);
+                }
             }
+        }
 
-            if new.get_counter() == 0 {
-                unsafe { self.drop_contents_and_maybe_box() };
-            } else {
-                // self.meta().thread_id.store(None, Ordering::Relaxed);
-                self.meta().thread_id.set(None);
-            }
+        if new.get_counter() == 0 {
+            unsafe { self.drop_contents_and_maybe_box() };
+        } else {
+            // self.meta().thread_id.store(None, Ordering::Relaxed);
+            self.meta().thread_id.set(None);
         }
 
         std::mem::forget(self);
@@ -734,26 +824,46 @@ impl TypeMap {
 
         for value in values.drain(..) {
             let mut value = value.0;
-            let mut old;
+            // let mut old;
+            // let mut new;
+            // loop {
+            //     old = value.meta_outer().shared.load(Ordering::Acquire);
+            //     new = old;
+            //     new.update_counter(|x| x + value.meta_outer().biased_counter.get() as i32);
+            //     new.set_merged(true);
+
+            //     if value
+            //         .meta_outer()
+            //         .shared
+            //         .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
+            //         .is_ok()
+            //     {
+            //         break;
+            //     }
+            // }
+
+            let mut old = value.meta_outer().shared.load(Ordering::Acquire);
             let mut new;
             loop {
-                old = value.meta_outer().shared.load(Ordering::Acquire);
                 new = old;
                 new.update_counter(|x| x + value.meta_outer().biased_counter.get() as i32);
                 new.set_merged(true);
 
-                if value
-                    .meta_outer()
-                    .shared
-                    .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    break;
+                match value.meta_outer().shared.compare_exchange(
+                    old,
+                    new,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(e) => {
+                        old = Packed(e);
+                    }
                 }
             }
 
             if new.get_counter() == 0 {
-                println!("invoking the destructor");
+                // println!("invoking the destructor");
                 unsafe { value.drop_contents_and_maybe_box_outer() };
             } else {
                 // value.meta_outer().thread_id.store(None, Ordering::Relaxed);
@@ -1895,4 +2005,85 @@ fn test_moving_across_threads() {
     }
 
     dbg!(merged);
+}
+
+#[test]
+fn test_dropping_across_multiple_threads() {
+    register_thread();
+    let original_value = BiasedRc::new("value".to_string());
+
+    let value_one = original_value.clone();
+    let other_thread_1 = std::thread::spawn(move || {
+        register_thread();
+        let value = value_one;
+
+        for _ in 0..1000 {
+            let _ = value.clone();
+        }
+
+        drop(value);
+    });
+
+    let value_one = original_value.clone();
+    let other_thread_2 = std::thread::spawn(move || {
+        let value = value_one;
+
+        for _ in 0..1000 {
+            let _ = value.clone();
+        }
+
+        drop(value);
+    });
+
+    other_thread_1.join().unwrap();
+    other_thread_2.join().unwrap();
+
+    let mut values = Vec::new();
+
+    for _ in 0..100 {
+        values.push(original_value.clone());
+    }
+
+    drop(original_value);
+
+    values.clear();
+
+    TypeMap::run_explicit_merge();
+}
+
+#[test]
+fn static_values() {
+    static ROOT: LazyLock<BiasedRc<String>> = LazyLock::new(|| BiasedRc::new("Hello".to_string()));
+    register_thread();
+
+    with_explicit_merge(|| {
+        let foo = ROOT.clone();
+        drop(foo);
+    });
+
+    with_explicit_merge(|| {
+        let foo = ROOT.clone();
+        drop(foo);
+    });
+
+    with_explicit_merge(|| {
+        register_thread();
+        let foo = ROOT.clone();
+        drop(foo);
+    });
+
+    with_explicit_merge(|| {
+        register_thread();
+        let foo = ROOT.clone();
+        drop(foo);
+    });
+
+    let foo = ROOT.clone();
+    drop(foo);
+
+    dbg!(ROOT.get_box().rcword.biased_counter.get());
+    let meta = ROOT.get_box().rcword.shared.load(Ordering::Relaxed);
+    dbg!(meta.get_merged());
+    dbg!(meta.get_queued());
+    dbg!(meta.get_counter());
 }
