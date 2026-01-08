@@ -542,6 +542,8 @@ impl<T: ?Sized> RcBox<T> {
             }
         }
 
+        std::sync::atomic::fence(Ordering::Acquire);
+
         if new.get_counter() == 0 {
             DecrementAction::Deallocate
         } else {
@@ -597,6 +599,8 @@ impl<T: ?Sized> RcBox<T> {
             }
         }
 
+        std::sync::atomic::fence(Ordering::Acquire);
+
         if old.get_queued() != new.get_queued() {
             DecrementAction::Queue
         } else if new.get_merged() && new.get_counter() == 0 {
@@ -606,12 +610,66 @@ impl<T: ?Sized> RcBox<T> {
         }
     }
 
-    // TODO: Figure out how to do this right?
     fn has_unique_ref(&self) -> bool {
+        let owner = self.rcword.thread_id.get();
+        match owner {
+            None => {
+                let meta = &self.rcword;
+                let mut new;
+                let mut old;
+
+                // loop {
+                old = meta.shared.load(Ordering::Relaxed);
+                new = old;
+
+                old.set_counter(1);
+                new.set_counter(0);
+
+                std::sync::atomic::fence(Ordering::Acquire);
+
+                if meta
+                    .shared
+                    .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_err()
+                {
+                    false
+                } else {
+                    // let owner = self.rcword.thread_id.get();
+                    // match owner {
+                    //     None => false,
+                    //     Some(tid) if tid == ThreadId::current_thread() => {
+                    //         self.rcword.biased_counter.get() as i32 == 1
+                    //     }
+                    //     Some(_) => false,
+                    // }
+
+                    true
+                }
+            }
+            Some(tid) if tid == ThreadId::current_thread() => {
+                let local_count = self.rcword.biased_counter.get();
+                if local_count == 1 {
+                    let meta = &self.rcword;
+                    let old = meta.shared.load(Ordering::Relaxed);
+                    std::sync::atomic::fence(Ordering::Acquire);
+                    if old.get_counter() != 0 { false } else { true }
+                } else {
+                    false
+                }
+            }
+
+            Some(_) => false,
+        }
+    }
+
+    // TODO: Figure out how to do this right?
+    fn has_unique_ref_old(&self) -> bool {
         let word = self.rcword.shared.load(Ordering::Acquire);
         let mut count = word.get_counter();
 
-        if word.get_counter() == 0 {
+        std::sync::atomic::fence(Ordering::Acquire);
+
+        if count == 0 {
             // let owner = self.rcword.thread_id.load(Ordering::Relaxed);
             let owner = self.rcword.thread_id.get();
             match owner {
@@ -807,10 +865,10 @@ impl TypeMap {
         let mut guard = QUEUE.lock();
         let id = ThreadId::current_thread();
         let q = guard.map.remove(&Some(id));
-        let unregistered = guard.map.remove(&Some(id));
+        // let unregistered = guard.map.remove(&Some(id));
         drop(guard);
         q.map(|mut x| Self::explicit_merge(&mut x));
-        unregistered.map(|mut x| Self::explicit_merge(&mut x));
+        // unregistered.map(|mut x| Self::explicit_merge(&mut x));
     }
 
     pub fn explicit_merge(values: &mut Vec<Wrapper>) -> usize {
@@ -1162,7 +1220,7 @@ impl<T: ?Sized + Clone> BiasedRc<T> {
     pub fn make_mut(this: &mut Self) -> &mut T {
         if !this.get_box().has_unique_ref() {
             // Another pointer exists; clone
-            *this = Self::new(T::clone(this));
+            *this = Self::new(T::clone(this.data()));
         }
 
         unsafe {
@@ -1387,6 +1445,9 @@ impl<T> BiasedRc<T> {
     fn try_unwrap_internal_same_thread(this: Self) -> Result<T, Self> {
         let meta = this.meta();
         let old = meta.shared.load(Ordering::Relaxed);
+
+        std::sync::atomic::fence(Ordering::Acquire);
+
         if old.get_counter() != 0 {
             Err(this)
         } else {
@@ -1414,6 +1475,8 @@ impl<T> BiasedRc<T> {
 
         old.set_counter(1);
         new.set_counter(0);
+
+        std::sync::atomic::fence(Ordering::Acquire);
 
         if meta
             .shared
@@ -2057,33 +2120,67 @@ fn static_values() {
     register_thread();
 
     with_explicit_merge(|| {
-        let foo = ROOT.clone();
+        let mut foo = ROOT.clone();
+
+        let new = BiasedRc::make_mut(&mut foo);
+        *new = "foo".to_string();
+
+        assert_eq!(foo.data(), "foo");
+        assert_eq!(ROOT.data(), "Hello");
+
         drop(foo);
     });
 
     with_explicit_merge(|| {
-        let foo = ROOT.clone();
+        let mut foo = ROOT.clone();
+
+        let new = BiasedRc::make_mut(&mut foo);
+        *new = "foo".to_string();
+
         drop(foo);
     });
 
     with_explicit_merge(|| {
         register_thread();
-        let foo = ROOT.clone();
+        let mut foo = ROOT.clone();
+
+        let new = BiasedRc::make_mut(&mut foo);
+        *new = "foo".to_string();
+
         drop(foo);
-    });
+    })
+    .join()
+    .unwrap();
 
     with_explicit_merge(|| {
         register_thread();
         let foo = ROOT.clone();
         drop(foo);
-    });
+    })
+    .join()
+    .unwrap();
 
     let foo = ROOT.clone();
     drop(foo);
 
-    dbg!(ROOT.get_box().rcword.biased_counter.get());
+    // dbg!(ROOT.get_box().rcword.biased_counter.get());
     let meta = ROOT.get_box().rcword.shared.load(Ordering::Relaxed);
     dbg!(meta.get_merged());
     dbg!(meta.get_queued());
     dbg!(meta.get_counter());
 }
+
+#[test]
+fn make_mut_test() {
+    let foo = BiasedRc::new("foo".to_string());
+    let mut copy = foo.clone();
+    let new_thing = BiasedRc::make_mut(&mut copy);
+
+    *new_thing = "hello".to_string();
+}
+
+// #[test]
+// fn test_merging() {
+//     let word = BiasedRc::new(10);
+//     drop(word);
+// }
