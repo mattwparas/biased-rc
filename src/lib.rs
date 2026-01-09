@@ -865,10 +865,8 @@ impl TypeMap {
         let mut guard = QUEUE.lock();
         let id = ThreadId::current_thread();
         let q = guard.map.remove(&Some(id));
-        // let unregistered = guard.map.remove(&Some(id));
         drop(guard);
         q.map(|mut x| Self::explicit_merge(&mut x));
-        // unregistered.map(|mut x| Self::explicit_merge(&mut x));
     }
 
     pub fn explicit_merge(values: &mut Vec<Wrapper>) -> usize {
